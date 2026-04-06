@@ -1,23 +1,19 @@
-"""
-CSE 251B — Example model.py
-
-This is a minimal example showing the required interface for your submission.
-Your model.py must contain a load_model() function with this signature.
-
-This example implements a tiny 2-layer Transformer (~1M params) for demonstration.
-It will have terrible perplexity — it's just to show the required structure.
-"""
-
 import torch
 import torch.nn as nn
 
 
 # --- Your model definition (replace with your architecture) ---
-
 class TinyGPT(nn.Module):
     """A minimal GPT for demonstration purposes."""
 
     def __init__(self, vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
+        # Model : Tokens -> Transformer Block(TB) -> TB -> ... -> TB -> Vocab Projection -> Logits
+        # TB    : Input -> Multi headed attention(MHA) -> Residual_Add -> Normalization -> MLP(2 linear layers) -> Residual_Add -> Normalization -> hidden rep.
+        # AF    : Non-linear function applied to a given input that outputs the same shape, IN(R,C): AF(IN) -> OUT(R,C)
+        # MLP   : Linear layer(LL_0) -> AF -> LL_1
+        # LL_0  : (d_feedforward X d_model) matrix of weights
+        # LL_1  : (d_model X d_feedforward) matrix of weights
+
         super().__init__()
         self.block_size = block_size
         self.token_emb = nn.Embedding(vocab_size, n_embd)
@@ -31,7 +27,10 @@ class TinyGPT(nn.Module):
             for _ in range(n_layer)
         ])
         self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        # self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.lm_head = self.token_emb # set the output and input token embeddings to be the same as it can potentially save a lot of parameters without losing much accuracy
+        self.num_parameters = sum(val.numel() for val in self.parameters())
+        
 
     def forward(self, input_ids):
         """
@@ -75,6 +74,12 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
         model: nn.Module in eval mode
     """
     # Load checkpoint
+    test_model = TinyGPT()
+    # for val in test_model.param_iter:
+    #     print(val.shape)
+    # print("Num params: ", test_model.num_parameters)
+    return test_model
+
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     # If you save config alongside weights, load it:
