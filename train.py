@@ -34,7 +34,7 @@ import argparse
 TRAIN_HELPER_FILENAME = "train_helper.py"
 
 # Example to resume training from a checkpoint
-# python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory
+# python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
 
 # Example to train a model from scratch
 # python train.py --device cuda --type scratch --folder my_model --data_fd_name data/shakespeare_char
@@ -43,8 +43,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--device", required=True)
 parser.add_argument("--type", required=True)
 parser.add_argument("--folder", required=True)
-parser.add_argument("--chpr", required=False) # folder_name/checkpoint_name (No extension)
-parser.add_argument("--data_fd_name", required=True) # data_folder_name/folder_name (No extension)
+parser.add_argument("--chpn", required=False) # folder_name to save checkpoints, only for from scratch init
+parser.add_argument("--chpr", required=False) # folder_name/checkpoint_file_name
+parser.add_argument("--data_fd_name", required=True) # data_folder_name/folder_name
 # parser.add_argument("--epochs", type=int, required=True)
 args = parser.parse_args()
 
@@ -54,6 +55,10 @@ init_from:str = args.type
 model_folder_name = args.folder
 model_path = os.path.join(os.getcwd(), model_folder_name)
 train_helper_path = os.path.join(model_path, TRAIN_HELPER_FILENAME)
+
+chkpt_folder_name_init = args.chpn
+if (not args.chpn is None and init_from != 'scratch'):
+    raise ValueError("Use --chpr folder/file_name on resume to specify a checkpoint folder to save to.\n")
 
 impl_module = th_loader.loadModule(TRAIN_HELPER_FILENAME, train_helper_path, model_path)
 train_helper.registerCreateModel(impl_module.createModel)
@@ -192,7 +197,7 @@ if init_from == 'scratch':
     # if meta_vocab_size is None:
     #     print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     # model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    model = train_helper.createModel(model_folder_name)
+    model = train_helper.createModel(model_folder_name, None, chkpt_folder_name_init)
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
     model.to(device)
 
@@ -200,7 +205,7 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     checkpoint_file_path = args.chpr
     print(f"Resuming from a checkpoint:{checkpoint_file_path}")
-    model, model_sd, opt_args, opt_sd = train_helper.createModel(model_folder_name, checkpoint_file_path, from_scratch=False)
+    model, model_sd, opt_args, opt_sd = train_helper.createModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
     model.load_state_dict(model_sd)
     model.to(device)
     optimizer = model.configure_optimizers(*opt_args)
@@ -227,21 +232,6 @@ else:
 # initialize a GradScaler. If enabled=False scaler is a no-op
 # scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
-
-# optimizer
-# if (init_from == 'scratch'):
-#     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-# else:
-#     optimizer = model.configure_optimizers(*opt_args)
-# if init_from == 'resume':
-#     optimizer.load_state_dict(checkpoint_opt)
-# checkpoint = None # free up memory
-
-# compile the model
-# if compile:
-#     print("compiling the model... (takes a ~minute)")
-#     unoptimized_model = model
-#     model = torch.compile(model) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -277,11 +267,6 @@ def get_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
-
-# logging
-# if wandb_log and master_process:
-#     import wandb
-#     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch

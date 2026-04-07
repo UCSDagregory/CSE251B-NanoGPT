@@ -9,9 +9,11 @@ MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
 MODEL_STATE_DICT = "model_state_dict"
 OPTIMIZER_STATE_DICT = "optimizer_state_dict"
+CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
 class nanoGPT(nn.Module):
-    def __init__(self, model_folder_name:str, author:str="N/A", 
+    def __init__(self, model_folder_name:str, chkpt_folder_name:str=None, 
+                 author:str="N/A",
                  vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
         # Model : Tokens -> Transformer Block(TB) -> TB -> ... -> TB -> Vocab Projection -> Logits
         # TB    : Input -> Multi headed attention(MHA) -> Residual_Add -> Normalization -> MLP(2 linear layers) -> Residual_Add -> Normalization -> hidden rep.
@@ -44,7 +46,11 @@ class nanoGPT(nn.Module):
 
         self.num_parameters = sum(val.numel() for val in self.parameters())
         self.author = author
-        self.checkpoint_path = os.path.join(os.getcwd(), model_folder_name, "checkpoints")
+        self.model_path = os.path.join(os.getcwd(), model_folder_name)
+        if (chkpt_folder_name is None):
+            self.checkpoint_folder_name = CHECKPOINT_DEFAULT
+        else:
+            self.checkpoint_folder_name = chkpt_folder_name
 
         self.opt_weight_decay = 0
         self.opt_learning_rate = 0
@@ -122,9 +128,11 @@ class nanoGPT(nn.Module):
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
         }
         save_file_name = f"{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
-        full_checkpoint_path = os.path.join(self.checkpoint_path, save_file_name)
+        # full_checkpoint_path = os.path.join(self.checkpoint_path, save_file_name)
+        # torch.save(checkpoint, full_checkpoint_path)
+        full_checkpoint_path = os.path.join(self.model_path, self.checkpoint_folder_name, save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
-    
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         self.opt_weight_decay = weight_decay
         self.opt_learning_rate = learning_rate
@@ -158,9 +166,14 @@ class nanoGPT(nn.Module):
 
 # file_name -> no extension, the needed one is added in the func. 
 def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any]:
-    load_path = os.path.join(os.getcwd(), model_folder_name, checkpoint_file_path+CHECKPOINT_EXT)
+    # load_path = os.path.join(os.getcwd(), model_folder_name, checkpoint_file_path+CHECKPOINT_EXT)
+    split_path = checkpoint_file_path.split('/')
+    if (len(split_path) != 2):
+        raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
+    chkpt_folder_name, ckpt_file_name  = split_path
+    load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
     checkpoint = torch.load(load_path, weights_only=True)
-    model_args = [model_folder_name]
+    model_args = [model_folder_name, chkpt_folder_name]
     model_saved_config = checkpoint[MODEL_CONFIG]
     for key in model_saved_config:
         model_args.append(model_saved_config[key])
@@ -170,11 +183,8 @@ def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple
         opt_args.append(opt_saved_config[key])
 
     gpt_model = nanoGPT(*model_args)
+    gpt_model.checkpoint_folder_name = chkpt_folder_name
     
-    # optimizer = gpt_model.configure_optimizers(*opt_args)
-    # gpt_model.load_state_dict(checkpoint[MODEL_STATE_DICT])
-    # optimizer.load_state_dict(checkpoint[OPTIMIZER_STATE_DICT])
-    # return gpt_model, optimizer
     model_sd = checkpoint[MODEL_STATE_DICT]
     opt_sd = checkpoint[OPTIMIZER_STATE_DICT]
     checkpoint = None
