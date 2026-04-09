@@ -1,8 +1,8 @@
 {
-    "author":"Dagin Gregory",
-    "vocab_size":"50304",
-    "n_embed":"128",
-    "num_heads":"4",
-    "num_layers":"2",
-    "block_size":"1024"
+    "author": "Ravi_Gadgil",
+    "vocab_size": "50257",
+    "n_embed": "768",
+    "num_heads": "12",
+    "num_layers": "8",
+    "block_size": "1024"
 }

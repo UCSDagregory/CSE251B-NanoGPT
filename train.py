@@ -67,7 +67,7 @@ train_helper.registerCreateModel(impl_module.createModel)
 eval_interval = 5
 log_interval = 1
 # eval_iters = 200
-eval_iters = 2
+eval_iters = 50
 eval_only = False # if True, script exits right after the first eval
 # always_save_checkpoint = False # if True, always save a checkpoint after each eval
 iters_per_checkpoint = 50
@@ -81,7 +81,7 @@ iters_per_checkpoint = 50
 # dataset = 'openwebtext'
 dataset = args.data_fd_name
 # gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-gradient_accumulation_steps = 1 * 1 # used to simulate larger batch sizes
+gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 
 block_size = 1024 #TODO: Consolidate this into a single source of truth derived from most likely the command line
@@ -95,6 +95,7 @@ block_size = 1024 #TODO: Consolidate this into a single source of truth derived 
 
 # adamw optimizer (Should also come from a config file of sorts)
 learning_rate = 6e-4 # max learning rate
+muon_lr = 0.02 
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -103,7 +104,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
+warmup_iters = 200 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
@@ -193,7 +194,7 @@ if init_from == 'scratch':
     #     print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     # model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     model = train_helper.createModel(model_folder_name)
-    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    muon_opt, adamw_opt = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, muon_lr)
     model.to(device)
 
 
@@ -203,8 +204,10 @@ elif init_from == 'resume':
     model, model_sd, opt_args, opt_sd = train_helper.createModel(model_folder_name, checkpoint_file_path, from_scratch=False)
     model.load_state_dict(model_sd)
     model.to(device)
-    optimizer = model.configure_optimizers(*opt_args)
-    optimizer.load_state_dict(opt_sd)
+    muon_opt, adamw_opt = model.configure_optimizers(*opt_args)
+    if isinstance(opt_sd, list):
+        muon_opt.load_state_dict(opt_sd[0])
+        adamw_opt.load_state_dict(opt_sd[1])
 
 # elif init_from.startswith('gpt2'):
 #     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
@@ -237,11 +240,11 @@ scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
 #     optimizer.load_state_dict(checkpoint_opt)
 # checkpoint = None # free up memory
 
-# compile the model
-# if compile:
-#     print("compiling the model... (takes a ~minute)")
-#     unoptimized_model = model
-#     model = torch.compile(model) # requires PyTorch 2.0
+
+if compile:
+    print("compiling the model... (takes a ~minute)")
+    unoptimized_model = model
+    model = torch.compile(model) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -292,7 +295,10 @@ running_mfu = -1.0
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
+    scale = lr / learning_rate
+    for param_group in muon_opt.param_groups:
+        param_group['lr'] = muon_lr * scale
+    for param_group in adamw_opt.param_groups:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
@@ -321,7 +327,7 @@ while True:
                 #     'config': config,
                 # }
                 print(f"Current val loss:{losses['val']:.4f}")
-                model.saveCheckpoint(optimizer, losses['val'])
+                model.saveCheckpoint((muon_opt, adamw_opt), losses['val'])
                 # print(f"saving checkpoint to {out_dir}")
                 # torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
@@ -343,16 +349,13 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
+        loss.backward()
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+    muon_opt.step()
+    adamw_opt.step()
+    muon_opt.zero_grad(set_to_none=True)
+    adamw_opt.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
