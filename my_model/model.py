@@ -36,7 +36,7 @@ class nanoGPT(nn.Module):
         ])
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.lm_head.weight = self.token_emb.weight # set the output and input token embeddings to be the same as it can potentially save a lot of parameters without losing much accuracy
+        self.lm_head.weight = self.token_emb.weight # set the output and input token embeddings to be the same as it can save parameters without losing much accuracy
 
         self.vocab_size = vocab_size
         self.n_layer = n_layer
@@ -80,14 +80,16 @@ class nanoGPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+        # else:
+        #     # inference-time mini-optimization: only forward the lm_head on the very last position
+        #     logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+        #     loss = None
 
-        # return logits
+        # Evaluation return path, only expects logits
+        if (targets is None):
+            return logits
+        # Training return path, wants logits and loss with respect to a target for simplicitly
         return logits, loss
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
@@ -105,6 +107,10 @@ class nanoGPT(nn.Module):
         mfu = flops_achieved / flops_promised
         # mfu = flops_achieved
         return mfu
+
+    def getCheckpointPath(self):
+        full_path = os.path.join(self.model_path, self.checkpoint_folder_name)
+        return full_path
 
     # file_name -> no extension, the needed one is added in the func. 
     # def saveCheckpoint(self, file_name:str, epoch:int, optimizer:nn.Module, loss:int):
@@ -128,9 +134,8 @@ class nanoGPT(nn.Module):
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
         }
         save_file_name = f"{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
-        # full_checkpoint_path = os.path.join(self.checkpoint_path, save_file_name)
-        # torch.save(checkpoint, full_checkpoint_path)
-        full_checkpoint_path = os.path.join(self.model_path, self.checkpoint_folder_name, save_file_name)
+        # full_checkpoint_path = os.path.join(self.model_path, self.checkpoint_folder_name, save_file_name)
+        full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
@@ -164,15 +169,7 @@ class nanoGPT(nn.Module):
 
         return optimizer
 
-# file_name -> no extension, the needed one is added in the func. 
-def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any]:
-    # load_path = os.path.join(os.getcwd(), model_folder_name, checkpoint_file_path+CHECKPOINT_EXT)
-    split_path = checkpoint_file_path.split('/')
-    if (len(split_path) != 2):
-        raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
-    chkpt_folder_name, ckpt_file_name  = split_path
-    load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
-    checkpoint = torch.load(load_path, weights_only=True)
+def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
     model_args = [model_folder_name, chkpt_folder_name]
     model_saved_config = checkpoint[MODEL_CONFIG]
     for key in model_saved_config:
@@ -181,6 +178,16 @@ def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple
     opt_saved_config = checkpoint[OPT_CONFIG]
     for key in opt_saved_config:
         opt_args.append(opt_saved_config[key])
+    return model_args, opt_args
+
+def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any]:
+    split_path = checkpoint_file_path.split('/')
+    if (len(split_path) != 2):
+        raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
+    chkpt_folder_name, ckpt_file_name  = split_path
+    load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
+    checkpoint = torch.load(load_path, weights_only=True)
+    model_args, opt_args = getArgs(checkpoint, model_folder_name, chkpt_folder_name)
 
     gpt_model = nanoGPT(*model_args)
     gpt_model.checkpoint_folder_name = chkpt_folder_name
@@ -209,21 +216,13 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     """
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-
-    # If you save config alongside weights, load it:
-    # config = checkpoint["config"]
-    # model = TinyGPT(**config)
-    # model.load_state_dict(checkpoint["model_state_dict"])
-
-    # Simple case: checkpoint is just the state_dict
-    model = nanoGPT()  # Use your config here
+    model_args, opt_args = getArgs(checkpoint)
+    model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
     print(f"#Params: {model.num_parameters}")
-
-
-    # model.to(device)
-    # model.eval()
-    # return model
+    model.to(device)
+    model.eval()
+    return model
 
 
 # --- Optional: quick sanity check ---

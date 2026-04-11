@@ -69,13 +69,16 @@ train_helper.registerCreateModel(impl_module.createModel)
 # out_dir = 'checkpoints'
 
 # eval_interval = 2000
-eval_interval = 5
+eval_interval = 50 # How many iters until re-calculate val. loss
+# eval_interval = 5
 log_interval = 1
-# eval_iters = 200
-eval_iters = 2
+eval_iters = 5 # How many times to calculate val.loss per 'eval interval'
+# eval_iters = 2
 eval_only = False # if True, script exits right after the first eval
 # always_save_checkpoint = False # if True, always save a checkpoint after each eval
-iters_per_checkpoint = 50
+# iters_per_checkpoint = 50
+iters_per_checkpoint = 250
+max_checkpoints_to_keep = 50
 
 # # wandb logging
 # wandb_log = False # disabled by default
@@ -86,10 +89,10 @@ iters_per_checkpoint = 50
 # dataset = 'openwebtext'
 dataset = args.data_fd_name
 # gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-gradient_accumulation_steps = 1 * 1 # used to simulate larger batch sizes
+# gradient_accumulation_steps = 1 * 4 # used to simulate larger batch sizes
+gradient_accumulation_steps = 16 * 1 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-
-block_size = 1024 #TODO: Consolidate this into a single source of truth derived from most likely the command line
+block_size = 1024 # Defined by project specs, DO NOT CHANGE
 
 # model (Should all be defined within your model class or passed as params. through some medium, probably a text file)
 # n_layer = 12
@@ -201,7 +204,6 @@ if init_from == 'scratch':
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
     model.to(device)
 
-
 elif init_from == 'resume':
     checkpoint_file_path = args.chpr
     print(f"Resuming from a checkpoint:{checkpoint_file_path}")
@@ -274,6 +276,10 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+model_checkpoint_path = model.getCheckpointPath()
+current_checkpoints = len(os.listdir(model_checkpoint_path))
+
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -284,31 +290,19 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        # if wandb_log:
-        #     wandb.log({
-        #         "iter": iter_num,
-        #         "train/loss": losses['train'],
-        #         "val/loss": losses['val'],
-        #         "lr": lr,
-        #         "mfu": running_mfu*100, # convert to percentage
-        #     })
 
         # if losses['val'] < best_val_loss or always_save_checkpoint:
         if losses['val'] < best_val_loss or iter_num%iters_per_checkpoint == 0:
             best_val_loss = losses['val']
             if iter_num >= 0:
-                # checkpoint = {
-                #     'model': raw_model.state_dict(),
-                #     'optimizer': optimizer.state_dict(),
-                #     'model_args': model_args,
-                #     'iter_num': iter_num,
-                #     'best_val_loss': best_val_loss,
-                #     'config': config,
-                # }
                 print(f"Current val loss:{losses['val']:.4f}")
+                if (current_checkpoints >= max_checkpoints_to_keep):
+                    files = os.listdir(model_checkpoint_path) # pseudo sorted because the val. loss is expected to decrease with time
+                    chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
+                    print(f"Removing checkpoint: {chkpt_to_remove}")
+                    os.remove(chkpt_to_remove)
                 model.saveCheckpoint(optimizer, losses['val'])
-                # print(f"saving checkpoint to {out_dir}")
-                # torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
     if iter_num == 0 and eval_only:
         break
 
