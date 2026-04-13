@@ -49,6 +49,7 @@ def parseOptParams(file_path):
         data = json.load(file)
         for key in data:
             args.append(data[key])
+        global LEARNING_RATE
         LEARNING_RATE = data['learning_rate']
     return args
 
@@ -119,7 +120,7 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024 # Defined by project specs, DO NOT CHANGE
 
 # adamw optimizer (Should also come from a config file of sorts)
-max_iters = 600000 # total number of training iterations
+max_iters = 5 # total number of training iterations
 # learning_rate = 6e-4 # max learning rate
 # weight_decay = 1e-1
 # beta1 = 0.9
@@ -255,7 +256,7 @@ else:
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 # scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # wrap model into DDP container
 if ddp:
