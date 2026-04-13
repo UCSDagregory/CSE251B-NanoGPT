@@ -4,9 +4,7 @@ import os
 import inspect
 from torch.nn import functional as F
 from typing import Any
-from helper_class import MambaBlock, RotaryPositionalEmbeddings
 
-#RUN WITH MPS
 MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
 MODEL_STATE_DICT = "model_state_dict"
@@ -15,7 +13,7 @@ CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
 class nanoGPT(nn.Module):
     def __init__(self, model_folder_name:str, chkpt_folder_name:str=None, 
-                 author:str="N/A", # Metadata args
+                 author:str="N/A",
                  vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
         # Model : Tokens -> Transformer Block(TB) -> TB -> ... -> TB -> Vocab Projection -> Logits
         # TB    : Input -> Multi headed attention(MHA) -> Residual_Add -> Normalization -> MLP(2 linear layers) -> Residual_Add -> Normalization -> hidden rep.
@@ -23,35 +21,23 @@ class nanoGPT(nn.Module):
         # MLP   : Linear layer(LL_0) -> AF -> LL_1
         # LL_0  : (d_feedforward X d_model) matrix of weights
         # LL_1  : (d_model X d_feedforward) matrix of weights
-        #attn_every: frequency of transformer layer relative to mamba layer
 
         super().__init__()
         self.block_size = block_size
         self.token_emb = nn.Embedding(vocab_size, n_embd)
-        #self.pos_emb = nn.Embedding(block_size, n_embd) # can use ROPE, learnable positional embedding that understands RELATIVE position
-
-        self.rope = RotaryPositionalEmbeddings(n_embd)
-        blocks = []
-        for i in range(n_layer):
-            if (i + 1) % attn_every == 0:       # layer 3, 6, 9... → Transformer
-                blocks.append(
-                    nn.TransformerEncoderLayer(
-                        d_model=n_embd, nhead=n_head,
-                        dim_feedforward=4 * n_embd, dropout=0.1,
-                        activation="gelu", batch_first=True,
-                    )
-                )
-            else:                                # all others → Mamba
-                blocks.append(
-                    MambaBlock(d_model=n_embd)
-                )
-
-        self.blocks = nn.ModuleList(blocks)
+        self.pos_emb = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=n_embd, nhead=n_head,
+                dim_feedforward=4 * n_embd, dropout=0.1,
+                activation="gelu", batch_first=True,
+            )
+            for _ in range(n_layer)
+        ])
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight # set the output and input token embeddings to be the same as it can save parameters without losing much accuracy
 
-        #Bookkeeping parameters
         self.vocab_size = vocab_size
         self.n_layer = n_layer
         self.n_head = n_head
@@ -80,10 +66,8 @@ class nanoGPT(nn.Module):
         """
         B, T = input_ids.shape
         tok_emb = self.token_emb(input_ids)
-        
-        x = tok_emb.permute(1,0,2).unsqueeze(2)
-        x = self.rope(x) #applying RoPE on the token embedddings
-        x = x.squeeze(2).permute(1, 0, 2)
+        pos_emb = self.pos_emb(torch.arange(T, device=input_ids.device))
+        x = tok_emb + pos_emb
 
         # Causal mask
         mask = torch.triu(torch.ones(T, T, device=input_ids.device), diagonal=1).bool()
