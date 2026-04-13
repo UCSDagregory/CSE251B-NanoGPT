@@ -13,7 +13,7 @@ CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
 class nanoGPT(nn.Module):
     def __init__(self, model_folder_name:str, chkpt_folder_name:str=None, 
-                 author:str="N/A", # Metadata args
+                 author:str="N/A",
                  vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
         # Model : Tokens -> Transformer Block(TB) -> TB -> ... -> TB -> Vocab Projection -> Logits
         # TB    : Input -> Multi headed attention(MHA) -> Residual_Add -> Normalization -> MLP(2 linear layers) -> Residual_Add -> Normalization -> hidden rep.

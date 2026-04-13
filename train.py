@@ -31,7 +31,11 @@ import train_helper_generic as train_helper
 import train_helper_loader as th_loader
 import argparse
 
+import json
+
 TRAIN_HELPER_FILENAME = "train_helper.py"
+OPT_FILENAME = "training_opt_params.json"
+LEARNING_RATE = -1
 
 # Example to resume training from a checkpoint
 # python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
@@ -39,14 +43,24 @@ TRAIN_HELPER_FILENAME = "train_helper.py"
 # Example to train a model from scratch
 # python train.py --device cuda --type scratch --folder my_model --data_fd_name data/shakespeare_char
 
+def parseOptParams(file_path):
+    args = []
+    with open(file_path, 'r') as file:
+        data = json.load(file)
+        for key in data:
+            args.append(data[key])
+        LEARNING_RATE = data['learning_rate']
+    return args
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--device", required=True)
 parser.add_argument("--type", required=True)
 parser.add_argument("--folder", required=True)
+parser.add_argument("--data_fd_name", required=True) # data_folder_name/folder_name
 parser.add_argument("--chpn", required=False) # folder_name to save checkpoints, only for from scratch init
 parser.add_argument("--chpr", required=False) # folder_name/checkpoint_file_name
-parser.add_argument("--data_fd_name", required=True) # data_folder_name/folder_name
-# parser.add_argument("--epochs", type=int, required=True)
+parser.add_argument("--opt_name", required=False)
+
 args = parser.parse_args()
 
 init_from:str = args.type
@@ -62,6 +76,16 @@ if (not args.chpn is None and init_from != 'scratch'):
 
 impl_module = th_loader.loadModule(TRAIN_HELPER_FILENAME, train_helper_path, model_path)
 train_helper.registerCreateModel(impl_module.createModel)
+
+arg_opt_path = args.opt_name
+if (arg_opt_path is None):
+    arg_opt_path = OPT_FILENAME
+opt_path = os.path.join(model_path, arg_opt_path)
+parsed_opt_args = parseOptParams(opt_path)
+if (LEARNING_RATE == -1):
+    raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
+
+
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -94,25 +118,19 @@ gradient_accumulation_steps = 16 * 1 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024 # Defined by project specs, DO NOT CHANGE
 
-# model (Should all be defined within your model class or passed as params. through some medium, probably a text file)
-# n_layer = 12
-# n_head = 12
-# n_embd = 768
-# dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-# bias = False # do we use bias inside LayerNorm and Linear layers?
-
 # adamw optimizer (Should also come from a config file of sorts)
-learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
+# learning_rate = 6e-4 # max learning rate
+# weight_decay = 1e-1
+# beta1 = 0.9
+# beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+# warmup_iters = 2000 # how many steps to warm up for
+warmup_iters = 200 # how many steps to warm up for
+lr_decay_iters = int(max_iters*1.0) # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # DDP settings
@@ -201,7 +219,11 @@ if init_from == 'scratch':
     #     print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     # model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     model = train_helper.createModel(model_folder_name, None, chkpt_folder_name_init)
-    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    # optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    # opt_args = parsed_opt_args.append(device_type)
+    opt_args = parsed_opt_args
+    opt_args.append(device_type)
+    optimizer = model.configure_optimizers(*opt_args)
     model.to(device)
 
 elif init_from == 'resume':
@@ -257,10 +279,11 @@ def estimate_loss():
     return out
 
 # learning rate decay scheduler (cosine with warmup)
+# LEARNING_RATE comes from the passed in optimizer parameters.json file
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
+        return LEARNING_RATE * (it + 1) / (warmup_iters + 1)
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
@@ -268,7 +291,7 @@ def get_lr(it):
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return min_lr + coeff * (LEARNING_RATE - min_lr)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch

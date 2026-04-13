@@ -2,7 +2,7 @@
     "author":"Dagin Gregory",
     "vocab_size":50257,
     "n_embed":128,
-    "num_heads":4,
-    "num_layers":2,
+    "num_heads":16,
+    "num_layers":20,
     "block_size":1024
 }
