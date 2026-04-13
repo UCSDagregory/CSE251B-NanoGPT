@@ -1,6 +1,6 @@
 ## Documentation
 
-- [Training Loop Guide](./docs/training-loop-guide.md)
+- [Training Loop Guide](./docs/TRAINING_LOOP_GUIDE.md)
 
 # CSE 251B Spring 2026 — NanoGPT Competition
 
