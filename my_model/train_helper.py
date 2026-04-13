@@ -5,11 +5,11 @@ import os
 param_file_name = "training_model_params.json"
 METADATA_KEYS = ["author"]
 
-def createModel(model_folder_name:str, checkpoint_file_path:str=None, from_scratch=True) -> model.nanoGPT:
+def createModel(model_folder_name:str, checkpoint_file_path:str=None, chkpt_folder_name_init:str=None, from_scratch=True) -> model.nanoGPT:
     param_file_path = os.path.join(os.getcwd(), model_folder_name, param_file_name)
     # Read from train
     if (from_scratch):
-        args = [model_folder_name]
+        args = [model_folder_name, chkpt_folder_name_init]
         with open(param_file_path, 'r') as file:
             data = json.load(file)
             # Metadata args
@@ -23,7 +23,7 @@ def createModel(model_folder_name:str, checkpoint_file_path:str=None, from_scrat
             for key in data:
                 if (key in METADATA_KEYS):
                     continue
-                args.append(int(data[key]))
+                args.append(data[key])
 
         gpt_model = model.nanoGPT(*args)
         return gpt_model

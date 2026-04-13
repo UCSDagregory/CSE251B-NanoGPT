@@ -1,275 +1,246 @@
 import torch
 import torch.nn as nn
 import os
-import math
+import inspect
 from torch.nn import functional as F
+from typing import Any
 
 MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
 MODEL_STATE_DICT = "model_state_dict"
 OPTIMIZER_STATE_DICT = "optimizer_state_dict"
+CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
-
-
-# ---------------------------------------------------------------------------
-# Muon Optimizer
-# ---------------------------------------------------------------------------
-
-def _zeropower_via_newtonschulz5(G, steps=5):
-    assert G.ndim >= 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    X = X / (X.norm() + 1e-7)
-    transposed = X.size(0) > X.size(1)
-    if transposed:
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
-    if transposed:
-        X = X.T
-    return X.to(G.dtype)
-
-
-class Muon(torch.optim.Optimizer):
-    """
-    Muon — MomentUm Orthogonalized by Newton-schulz.
-    Apply to 2-D weight matrices in attn/MLP only.
-    Use AdamW for embeddings, norms, and biases.
-    Reference: https://github.com/KellerJordan/modded-nanogpt
-    """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            lr, momentum, nesterov, ns_steps = (
-                group['lr'], group['momentum'], group['nesterov'], group['ns_steps']
-            )
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                state = self.state[p]
-                if len(state) == 0:
-                    state['buf'] = torch.zeros_like(g)
-                buf = state['buf']
-                buf.mul_(momentum).add_(g)
-                update = g.add(buf, alpha=momentum) if nesterov else buf
-                if update.ndim >= 2:
-                    update = _zeropower_via_newtonschulz5(update, steps=ns_steps)
-                    p.add_(update, alpha=-lr * max(update.size(0), update.size(1)) ** 0.5)
-                else:
-                    p.add_(update, alpha=-lr)
-
-
-# ---------------------------------------------------------------------------
-# RoPE
-# ---------------------------------------------------------------------------
-
-def _precompute_rope(head_dim: int, block_size: int, base: float = 10000.0):
-    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-    freqs = torch.outer(torch.arange(block_size).float(), theta)  # (T, head_dim//2)
-    return freqs.cos(), freqs.sin()
-
-
-def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """x: (B, n_head, T, head_dim)"""
-    T = x.size(2)
-    cos = cos[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim//2)
-    sin = sin[:T].unsqueeze(0).unsqueeze(0)
-    x_even, x_odd = x[..., 0::2], x[..., 1::2]
-    return torch.stack([x_even * cos - x_odd * sin,
-                        x_even * sin + x_odd * cos], dim=-1).flatten(-2)
-
-
-# ---------------------------------------------------------------------------
-# Transformer blocks
-# ---------------------------------------------------------------------------
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, block_size: int):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head   = n_head
-        self.head_dim = n_embd // n_head
-        self.c_attn   = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj   = nn.Linear(n_embd, n_embd,     bias=False)
-        cos, sin = _precompute_rope(self.head_dim, block_size)
-        self.register_buffer('rope_cos', cos, persistent=False)
-        self.register_buffer('rope_sin', sin, persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.shape
-        q, k, v = self.c_attn(x).split(C, dim=2)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        q = _apply_rope(q, self.rope_cos, self.rope_sin)
-        k = _apply_rope(k, self.rope_cos, self.rope_sin)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # flash attention
-        return self.c_proj(y.transpose(1, 2).contiguous().view(B, T, C))
-
-
-class MLP(nn.Module):
-    def __init__(self, n_embd: int):
-        super().__init__()
-        self.c_fc   = nn.Linear(n_embd, 4 * n_embd, bias=False)
-        self.gelu   = nn.GELU()
-        self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.c_proj(self.gelu(self.c_fc(x)))
-
-
-class Block(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, block_size: int):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, block_size)
-        self.ln_2 = nn.LayerNorm(n_embd)
-        self.mlp  = MLP(n_embd)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))   # pre-norm
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
-
-# ---------------------------------------------------------------------------
-# Main model
-# ---------------------------------------------------------------------------
-
 class nanoGPT(nn.Module):
-    def __init__(self, model_folder_name: str, author: str = "N/A",
-                 vocab_size: int = 50257, n_embd: int = 768, n_head: int = 12,
-                 n_layer: int = 8, block_size: int = 1024):
+    def __init__(self, model_folder_name:str, chkpt_folder_name:str=None, 
+                 author:str="N/A",
+                 vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
+        # Model : Tokens -> Transformer Block(TB) -> TB -> ... -> TB -> Vocab Projection -> Logits
+        # TB    : Input -> Multi headed attention(MHA) -> Residual_Add -> Normalization -> MLP(2 linear layers) -> Residual_Add -> Normalization -> hidden rep.
+        # AF    : Non-linear function applied to a given input that outputs the same shape, IN(R,C): AF(IN) -> OUT(R,C)
+        # MLP   : Linear layer(LL_0) -> AF -> LL_1
+        # LL_0  : (d_feedforward X d_model) matrix of weights
+        # LL_1  : (d_model X d_feedforward) matrix of weights
+
         super().__init__()
         self.block_size = block_size
-        self.vocab_size = vocab_size
-        self.n_layer    = n_layer
-        self.n_head     = n_head
-        self.n_embd     = n_embd
-        self.author     = author
-
         self.token_emb = nn.Embedding(vocab_size, n_embd)
-        self.blocks    = nn.ModuleList([Block(n_embd, n_head, block_size) for _ in range(n_layer)])
-        self.ln_f      = nn.LayerNorm(n_embd)
-        self.lm_head   = nn.Linear(n_embd, vocab_size, bias=False)
-        self.lm_head.weight = self.token_emb.weight   # weight tying
+        self.pos_emb = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=n_embd, nhead=n_head,
+                dim_feedforward=4 * n_embd, dropout=0.1,
+                activation="gelu", batch_first=True,
+            )
+            for _ in range(n_layer)
+        ])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.lm_head.weight = self.token_emb.weight # set the output and input token embeddings to be the same as it can save parameters without losing much accuracy
 
-        self.apply(self._init_weights)
-        self.num_parameters = sum(v.numel() for v in self.parameters())
-        self.checkpoint_path = os.path.join(os.getcwd(), model_folder_name, "checkpoints")
-        self.opt_weight_decay  = 0
-        self.opt_learning_rate = 0
-        self.opt_betas         = 0
-        self.opt_device_type   = 0
-        self.opt_muon_lr       = 0.02
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.block_size = block_size
 
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, input_ids: torch.Tensor, targets: torch.Tensor = None):
-        x = self.token_emb(input_ids)
-        for block in self.blocks:
-            x = block(x)
-        x = self.ln_f(x)
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        self.num_parameters = sum(val.numel() for val in self.parameters())
+        self.author = author
+        self.model_path = os.path.join(os.getcwd(), model_folder_name)
+        if (chkpt_folder_name is None):
+            self.checkpoint_folder_name = CHECKPOINT_DEFAULT
         else:
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
+            self.checkpoint_folder_name = chkpt_folder_name
+
+        self.opt_weight_decay = 0
+        self.opt_learning_rate = 0
+        self.opt_betas = 0
+        self.opt_device_type = 0
+
+    def forward(self, input_ids, targets=None):
+        """
+        Args:
+            input_ids: LongTensor of shape (batch_size, seq_len)
+        Returns:
+            logits: FloatTensor of shape (batch_size, seq_len, 50257)
+        """
+        B, T = input_ids.shape
+        tok_emb = self.token_emb(input_ids)
+        pos_emb = self.pos_emb(torch.arange(T, device=input_ids.device))
+        x = tok_emb + pos_emb
+
+        # Causal mask
+        mask = torch.triu(torch.ones(T, T, device=input_ids.device), diagonal=1).bool()
+
+        for block in self.blocks:
+            x = block(x, src_mask=mask, is_causal=True)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        # else:
+        #     # inference-time mini-optimization: only forward the lm_head on the very last position
+        #     logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+        #     loss = None
+
+        # Evaluation return path, only expects logits
+        if (targets is None):
+            return logits
+        # Training return path, wants logits and loss with respect to a target for simplicitly
         return logits, loss
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.num_parameters
-        L, H, Q, T = self.n_layer, self.n_head, self.n_embd // self.n_head, self.block_size
-        flops_per_iter = (6 * N + 12 * L * H * Q * T) * T * fwdbwd_per_iter
-        return flops_per_iter / (dt * 312e12)
+        L, H, Q, T = self.n_layer, self.n_head, self.n_embd//self.n_head, self.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0/dt) # per second
+        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
+        # mfu = flops_achieved
+        return mfu
 
-    def saveCheckpoint(self, optimizer, val_loss: float):
-        os.makedirs(self.checkpoint_path, exist_ok=True)
-        opt_sd = [o.state_dict() for o in optimizer] if isinstance(optimizer, (list, tuple)) \
-                 else optimizer.state_dict()
+    def getCheckpointPath(self):
+        full_path = os.path.join(self.model_path, self.checkpoint_folder_name)
+        return full_path
+
+    # file_name -> no extension, the needed one is added in the func. 
+    # def saveCheckpoint(self, file_name:str, epoch:int, optimizer:nn.Module, loss:int):
+    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int):
         checkpoint = {
             MODEL_CONFIG: {
-                "author":     self.author,
+                "author": self.author,
                 "vocab_size": self.vocab_size,
-                "n_embd":     self.n_embd,
-                "n_head":     self.n_head,
-                "n_layer":    self.n_layer,
-                "block_size": self.block_size,
+                "n_embd": self.n_embd,
+                "n_head": self.n_head,
+                "n_layer": self.n_layer,
+                "block_size": self.block_size
             },
-            OPT_CONFIG: {
-                "weight_decay":  self.opt_weight_decay,
-                "learning_rate": self.opt_learning_rate,
-                "betas":         self.opt_betas,
-                "device_type":   self.opt_device_type,
-                "muon_lr":       self.opt_muon_lr,
+            OPT_CONFIG:{
+                "weight_decay":self.opt_weight_decay,
+                "learning_rate":self.opt_learning_rate,
+                "betas":self.opt_betas,
+                "device_type":self.opt_device_type,
             },
-            MODEL_STATE_DICT:     self.state_dict(),
-            OPTIMIZER_STATE_DICT: opt_sd,
+            MODEL_STATE_DICT: self.state_dict(),
+            OPTIMIZER_STATE_DICT: optimizer.state_dict(),
         }
-        fname = f"{val_loss:08.4f}val_loss_{nanoGPT.__name__}_{self.author.replace(' ', '')}{CHECKPOINT_EXT}"
-        torch.save(checkpoint, os.path.join(self.checkpoint_path, fname))
+        save_file_name = f"{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+        # full_checkpoint_path = os.path.join(self.model_path, self.checkpoint_folder_name, save_file_name)
+        full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
+        torch.save(checkpoint, full_checkpoint_path)
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, muon_lr=0.02):
-        """Returns (muon_optimizer, adamw_optimizer)."""
-        self.opt_weight_decay  = weight_decay
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        self.opt_weight_decay = weight_decay
         self.opt_learning_rate = learning_rate
-        self.opt_betas         = betas
-        self.opt_device_type   = device_type
-        self.opt_muon_lr       = muon_lr
+        self.opt_betas = betas
+        self.opt_device_type = device_type
 
-        muon_params, adamw_params = [], []
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-            if param.ndim >= 2 and 'emb' not in name:
-                muon_params.append(param)   # 2-D attn/MLP weights → Muon
-            else:
-                adamw_params.append(param)  # embeddings, norms → AdamW
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
 
-        muon  = Muon(muon_params, lr=muon_lr, momentum=0.95)
-        adamw = torch.optim.AdamW(adamw_params, lr=learning_rate,
-                                  betas=betas, weight_decay=weight_decay)
-        print(f"Muon params: {sum(p.numel() for p in muon_params):,} | "
-              f"AdamW params: {sum(p.numel() for p in adamw_params):,}")
-        return muon, adamw
+        return optimizer
 
+def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
+    model_args = [model_folder_name, chkpt_folder_name]
+    model_saved_config = checkpoint[MODEL_CONFIG]
+    for key in model_saved_config:
+        model_args.append(model_saved_config[key])
+    opt_args = []
+    opt_saved_config = checkpoint[OPT_CONFIG]
+    for key in opt_saved_config:
+        opt_args.append(opt_saved_config[key])
+    return model_args, opt_args
 
-# ---------------------------------------------------------------------------
-# Checkpoint I/O
-# ---------------------------------------------------------------------------
+def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any]:
+    split_path = checkpoint_file_path.split('/')
+    if (len(split_path) != 2):
+        raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
+    chkpt_folder_name, ckpt_file_name  = split_path
+    load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
+    checkpoint = torch.load(load_path, weights_only=True)
+    model_args, opt_args = getArgs(checkpoint, model_folder_name, chkpt_folder_name)
 
-def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str):
-    load_path = os.path.join(os.getcwd(), model_folder_name, checkpoint_file_path + CHECKPOINT_EXT)
-    ckpt = torch.load(load_path, weights_only=True)
-    cfg = ckpt[MODEL_CONFIG]
-    model = nanoGPT(model_folder_name, author=cfg["author"], vocab_size=cfg["vocab_size"],
-                    n_embd=cfg["n_embd"], n_head=cfg["n_head"],
-                    n_layer=cfg["n_layer"], block_size=cfg["block_size"])
-    opt_cfg  = ckpt[OPT_CONFIG]
-    opt_args = [opt_cfg["weight_decay"], opt_cfg["learning_rate"],
-                opt_cfg["betas"],        opt_cfg["device_type"],
-                opt_cfg.get("muon_lr", 0.02)]
-    return model, ckpt[MODEL_STATE_DICT], opt_args, ckpt[OPTIMIZER_STATE_DICT]
+    gpt_model = nanoGPT(*model_args)
+    gpt_model.checkpoint_folder_name = chkpt_folder_name
+    
+    model_sd = checkpoint[MODEL_STATE_DICT]
+    opt_sd = checkpoint[OPTIMIZER_STATE_DICT]
+    checkpoint = None
+    return gpt_model, model_sd, opt_args, opt_sd
 
-
+# --- Required: load_model function ---
 def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
-    """Required interface for evaluate.py: input_ids (B,T) -> logits (B,T,50257)"""
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    cfg  = ckpt[MODEL_CONFIG]
-    model = nanoGPT(model_folder_name="", author=cfg.get("author", "N/A"),
-                    vocab_size=cfg["vocab_size"], n_embd=cfg["n_embd"],
-                    n_head=cfg["n_head"], n_layer=cfg["n_layer"], block_size=cfg["block_size"])
-    model.load_state_dict(ckpt[MODEL_STATE_DICT])
+    """
+    Load your trained model from a checkpoint.
+
+    This function is called by evaluate.py. It must return a model where:
+        model(input_ids) -> logits
+        - input_ids: LongTensor of shape (batch, seq_len)
+        - logits: FloatTensor of shape (batch, seq_len, 50257)
+
+    Args:
+        checkpoint_path: Path to your checkpoint.pt file
+        device: Device to load onto ("cuda" or "cpu")
+
+    Returns:
+        model: nn.Module in eval mode
+    """
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model_args, opt_args = getArgs(checkpoint)
+    model = nanoGPT(*model_args)
+    model.load_state_dict(checkpoint[MODEL_STATE_DICT])
+    print(f"#Params: {model.num_parameters}")
     model.to(device)
     model.eval()
     return model
+
+
+# --- Optional: quick sanity check ---
+
+# if __name__ == "__main__":
+#     print("Creating example model...")
+#     model = nanoGPT()
+#     n_params = sum(p.numel() for p in model.parameters())
+#     print(f"Parameters: {n_params:,}")
+
+#     # Test forward pass
+#     dummy_input = torch.randint(0, 50257, (2, 1024))
+#     logits = model(dummy_input)
+#     print(f"Input shape:  {dummy_input.shape}")
+#     print(f"Output shape: {logits.shape}")
+#     assert logits.shape == (2, 1024, 50257), "Output shape mismatch!"
+#     print("Interface check passed.")
+
+#     # Save example checkpoint
+#     torch.save(model.state_dict(), "checkpoint.pt")
+#     print("Saved example checkpoint.pt")
