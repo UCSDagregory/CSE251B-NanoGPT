@@ -1,5 +1,5 @@
 {
-    "author":"Dagin Gregory",
+    "author":"Some Body",
     "vocab_size":50257,
     "n_embed":128,
     "num_heads":4,

@@ -1,5 +1,8 @@
-*/checkpoints/*
-
+*.pt
+*/*/hf_cache
+*/*/tmp
+*train.bin
+*val.bin
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
