@@ -1,91 +1,101 @@
 # saves the fineweb-edu dataset to binary files next to this script
-# uses the sample-10BT subset (~10B tokens, ~9.67M documents)
+# streams data to avoid filling disk with parquet files
 
 import os
 from pathlib import Path
 
-# Resolve this script's directory once
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Put all Hugging Face intermediate/cache files under this directory
+# Minimal cache directory
 HF_ROOT = SCRIPT_DIR / "hf_cache"
-HF_DATASETS = HF_ROOT / "datasets"
-HF_HUB = HF_ROOT / "hub"
-TMP_DIR = SCRIPT_DIR / "tmp"
-
-for p in (HF_ROOT, HF_DATASETS, HF_HUB, TMP_DIR):
+for p in (HF_ROOT,):
     p.mkdir(parents=True, exist_ok=True)
 
-# Must be set before importing datasets / huggingface libs
 os.environ["HF_HOME"] = str(HF_ROOT)
-os.environ["HF_DATASETS_CACHE"] = str(HF_DATASETS)
-os.environ["HF_HUB_CACHE"] = str(HF_HUB)
-os.environ["TMP"] = str(TMP_DIR)
-os.environ["TEMP"] = str(TMP_DIR)
+os.environ["HF_DATASETS_CACHE"] = str(HF_ROOT / "datasets")
+os.environ["HF_HUB_CACHE"] = str(HF_ROOT / "hub")
 
 from tqdm import tqdm
 import numpy as np
 import tiktoken
 from datasets import load_dataset
 
-# number of workers in .map() call
-num_proc = 8
-num_proc_load_dataset = num_proc
-
-# validation split: hold out 0.05% for val (similar ratio to openwebtext)
-val_fraction = 0.0005
+# --- Config ---
+MAX_DOCS = 2_000_000       # ~2B tokens, fits in Kaggle's 30GB disk + 13GB RAM
+VAL_DOCS = 1_000            # small val set for quick eval during training
+num_proc = 4                # lower proc count to save RAM
 
 enc = tiktoken.get_encoding("gpt2")
 
+def tokenize_doc(text):
+    """Tokenize a single document, append EOT separator."""
+    ids = enc.encode_ordinary(text)
+    ids.append(enc.eot_token)
+    return ids
+
 if __name__ == '__main__':
-    # Load the 10BT sample subset of FineWeb-Edu
-    # This is ~9.67M documents and ~10B tokens — more than enough for 100M param models.
-    # To use a smaller subset for faster iteration, change to "sample-100BT" or
-    # add a .select(range(N)) call after loading.
+    print(f"Streaming FineWeb-Edu, taking {MAX_DOCS:,} documents...")
+
+    # Stream the dataset — nothing saved to disk during this step
     dataset = load_dataset(
         "HuggingFaceFW/fineweb-edu",
         name="sample-10BT",
         split="train",
-        num_proc=num_proc_load_dataset,
-        cache_dir=str(HF_DATASETS),
+        streaming=True,
     )
 
-    # Create train/val split
-    split_dataset = dataset.train_test_split(
-        test_size=val_fraction, seed=2357, shuffle=True
-    )
-    split_dataset["val"] = split_dataset.pop("test")
+    # Collect documents into train and val lists of token IDs
+    all_ids_train = []
+    all_ids_val = []
+    total_train_tokens = 0
+    total_val_tokens = 0
 
-    def process(example):
-        ids = enc.encode_ordinary(example["text"])
-        ids.append(enc.eot_token)  # add <|endoftext|> separator between documents
-        return {"ids": ids, "len": len(ids)}
+    for i, example in enumerate(tqdm(dataset, total=MAX_DOCS, desc="streaming & tokenizing")):
+        if i >= MAX_DOCS:
+            break
 
-    # Tokenize
-    tokenized = split_dataset.map(
-        process,
-        remove_columns=dataset.column_names,
-        desc="tokenizing the splits",
-        num_proc=num_proc,
-    )
+        ids = tokenize_doc(example["text"])
 
-    # Write to binary files
-    for split, dset in tokenized.items():
-        arr_len = np.sum(dset["len"], dtype=np.uint64)
-        filename = SCRIPT_DIR / f"{split}.bin"
-        dtype = np.uint16  # GPT-2 vocab is 50257, fits in uint16
-        arr = np.memmap(filename, dtype=dtype, mode="w+", shape=(arr_len,))
-        total_batches = 1024
+        if i < VAL_DOCS:
+            all_ids_val.append(ids)
+            total_val_tokens += len(ids)
+        else:
+            all_ids_train.append(ids)
+            total_train_tokens += len(ids)
 
-        idx = 0
-        for batch_idx in tqdm(range(total_batches), desc=f"writing {filename}"):
-            batch = dset.shard(
-                num_shards=total_batches,
-                index=batch_idx,
-                contiguous=True,
-            ).with_format("numpy")
-            arr_batch = np.concatenate(batch["ids"])
-            arr[idx : idx + len(arr_batch)] = arr_batch
-            idx += len(arr_batch)
+    print(f"Train: {len(all_ids_train):,} docs, {total_train_tokens:,} tokens")
+    print(f"Val:   {len(all_ids_val):,} docs, {total_val_tokens:,} tokens")
 
-        arr.flush()
+    # Write train.bin
+    print("Writing train.bin...")
+    train_file = SCRIPT_DIR / "train.bin"
+    arr = np.memmap(train_file, dtype=np.uint16, mode="w+", shape=(total_train_tokens,))
+    idx = 0
+    for ids in tqdm(all_ids_train, desc="writing train.bin"):
+        chunk = np.array(ids, dtype=np.uint16)
+        arr[idx : idx + len(chunk)] = chunk
+        idx += len(chunk)
+    arr.flush()
+    del arr, all_ids_train
+
+    # Write val.bin
+    print("Writing val.bin...")
+    val_file = SCRIPT_DIR / "val.bin"
+    arr = np.memmap(val_file, dtype=np.uint16, mode="w+", shape=(total_val_tokens,))
+    idx = 0
+    for ids in tqdm(all_ids_val, desc="writing val.bin"):
+        chunk = np.array(ids, dtype=np.uint16)
+        arr[idx : idx + len(chunk)] = chunk
+        idx += len(chunk)
+    arr.flush()
+    del arr, all_ids_val
+
+    # Clean up HF cache to free disk space before training
+    import shutil
+    if HF_ROOT.exists():
+        shutil.rmtree(HF_ROOT, ignore_errors=True)
+        print("Cleaned up HF cache.")
+
+    print(f"\nDone! Files saved to {SCRIPT_DIR}")
+    print(f"  train.bin: {train_file.stat().st_size / 1e9:.2f} GB")
+    print(f"  val.bin:   {val_file.stat().st_size / 1e6:.1f} MB")
