@@ -44,6 +44,7 @@ LEARNING_RATE = -1
 # python train.py --device cuda --type scratch --folder my_model --data_fd_name data/shakespeare_char
 
 def parseOptParams(file_path):
+    global LEARNING_RATE
     args = []
     with open(file_path, 'r') as file:
         data = json.load(file)
@@ -72,7 +73,10 @@ train_helper_path = os.path.join(model_path, TRAIN_HELPER_FILENAME)
 
 chkpt_folder_name_init = args.chpn
 if (not args.chpn is None and init_from != 'scratch'):
-    raise ValueError("Use --chpr folder/file_name on resume to specify a checkpoint folder to save to.\n")
+    raise ValueError("Use --chpn file_name on only on from scratch creation to specify where to save checkpoints to.\n")
+
+if (not args.chpr is None and init_from != 'resume'):
+    raise ValueError("Use --chpr only on resume to tell the model where to save future checkpoints and which checkpoint to resume training from.\n")
 
 impl_module = th_loader.loadModule(TRAIN_HELPER_FILENAME, train_helper_path, model_path)
 train_helper.registerCreateModel(impl_module.createModel)
@@ -180,23 +184,27 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 # data_dir = os.path.join('data', dataset)
+
+# data_dir = os.path.join(os.getcwd(), dataset)
+# def get_batch(split):
+#     # We recreate np.memmap every batch to avoid a memory leak, as per
+#     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+#     if split == 'train':
+#         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+#     else:
+#         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+#     ix = torch.randint(len(data) - block_size, (batch_size,))
+#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+#     if device_type == 'cuda':
+#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+#     else:
+#         x, y = x.to(device), y.to(device)
+#     return x, y
+
 data_dir = os.path.join(os.getcwd(), dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -214,13 +222,7 @@ best_val_loss = 1e9
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    # if meta_vocab_size is None:
-    #     print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    # model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     model = train_helper.createModel(model_folder_name, None, chkpt_folder_name_init)
-    # optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-    # opt_args = parsed_opt_args.append(device_type)
     opt_args = parsed_opt_args
     opt_args.append(device_type)
     optimizer = model.configure_optimizers(*opt_args)
@@ -235,15 +237,6 @@ elif init_from == 'resume':
     optimizer = model.configure_optimizers(*opt_args)
     optimizer.load_state_dict(opt_sd)
 
-# elif init_from.startswith('gpt2'):
-#     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-#     # initialize from OpenAI GPT-2 weights
-#     override_args = dict(dropout=dropout)
-#     model = GPT.from_pretrained(init_from, override_args)
-#     # read off the created config params, so we can store them into checkpoint correctly
-#     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-#         model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
 else:
     raise ValueError("Unknown input for --type")
 
@@ -270,7 +263,7 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             print(f"Loss({k}) estimate")
-            X, Y = get_batch(split)
+            X, Y = batch_helper.get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -294,7 +287,7 @@ def get_lr(it):
     return min_lr + coeff * (LEARNING_RATE - min_lr)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = batch_helper.get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -305,7 +298,7 @@ current_checkpoints = len(os.listdir(model_checkpoint_path))
 
 while True:
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -343,7 +336,7 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = batch_helper.get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
