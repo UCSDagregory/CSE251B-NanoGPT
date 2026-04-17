@@ -49,6 +49,91 @@ class RotaryPositionalEmbeddings(nn.Module):
     return x_rope
   
 
+class CausalSelfAttentionBlock(nn.Module):
+    """
+    A pre-norm causal multi-head self-attention block with RoPE applied to Q and K.
+    Replaces nn.TransformerEncoderLayer so we can inject RoPE inside attention.
+ 
+    Layout per block:
+        x -> LayerNorm -> MHA (RoPE on Q,K) -> Dropout -> residual add
+          -> LayerNorm -> MLP (Linear -> GELU -> Linear) -> Dropout -> residual add
+    """
+ 
+    def __init__(self, d_model: int, n_head: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_head == 0, "d_model must be divisible by n_head"
+ 
+        self.n_head   = n_head
+        self.head_dim = d_model // n_head
+ 
+        # Attention projections
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+ 
+        # RoPE operates on each head's query/key vectors (head_dim)
+        self.rope = RotaryPositionalEmbeddings(self.head_dim)
+ 
+        # MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(), 
+            nn.Linear(4 * d_model, d_model),
+        )
+ 
+        # Norms + dropout
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.drop  = nn.Dropout(dropout)
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq, d_model)  — batch_first convention
+        Returns:
+            x: (batch, seq, d_model)
+        """
+        B, T, C = x.shape
+ 
+        # ---- Self-attention with RoPE ----
+        residual = x
+        x = self.norm1(x)
+ 
+        # Project to Q, K, V and split into heads
+        # (B, T, C) -> (B, T, n_head, head_dim) -> (T, B, n_head, head_dim) for RoPE
+        def split_heads(t):
+            return t.view(B, T, self.n_head, self.head_dim).permute(1, 0, 2, 3)
+ 
+        q = split_heads(self.q_proj(x))  # (T, B, n_head, head_dim)
+        k = split_heads(self.k_proj(x))
+        v = split_heads(self.v_proj(x))
+ 
+        # Apply RoPE to Q and K only
+        q = self.rope(q)
+        k = self.rope(k)
+ 
+        # Reshape for scaled dot-product attention: (B, n_head, T, head_dim)
+        q = q.permute(1, 2, 0, 3)
+        k = k.permute(1, 2, 0, 3)
+        v = v.permute(1, 2, 0, 3)
+ 
+        # Causal scaled dot-product attention (uses Flash Attention when available)
+        attn_out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.drop.p if self.training else 0.0,
+            is_causal=True,
+        )  # (B, n_head, T, head_dim)
+ 
+        # Merge heads back: (B, T, C)
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, T, C)
+        x = residual + self.drop(self.out_proj(attn_out))
+ 
+        # ---- MLP ----
+        x = x + self.drop(self.mlp(self.norm2(x)))
+ 
+        return x
+ 
 
 #1 block layer of Mamba SSM
 class MambaBlock(nn.Module):

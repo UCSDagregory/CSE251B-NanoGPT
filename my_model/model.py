@@ -4,7 +4,7 @@ import os
 import inspect
 from torch.nn import functional as F
 from typing import Any
-from helper_class import MambaBlock, RotaryPositionalEmbeddings
+from helper_class import MambaBlock, CausalSelfAttentionBlock
 
 #RUN WITH MPS
 MODEL_CONFIG = "model_config"
@@ -23,22 +23,22 @@ class nanoGPT(nn.Module):
         # MLP   : Linear layer(LL_0) -> AF -> LL_1
         # LL_0  : (d_feedforward X d_model) matrix of weights
         # LL_1  : (d_model X d_feedforward) matrix of weights
+       
         #attn_every: frequency of transformer layer relative to mamba layer
-
+        attn_every = 3
         super().__init__()
         self.block_size = block_size
         self.token_emb = nn.Embedding(vocab_size, n_embd)
         #self.pos_emb = nn.Embedding(block_size, n_embd) # can use ROPE, learnable positional embedding that understands RELATIVE position
 
-        self.rope = RotaryPositionalEmbeddings(n_embd)
+
         blocks = []
         for i in range(n_layer):
             if (i + 1) % attn_every == 0:       # layer 3, 6, 9... → Transformer
                 blocks.append(
-                    nn.TransformerEncoderLayer(
-                        d_model=n_embd, nhead=n_head,
-                        dim_feedforward=4 * n_embd, dropout=0.1,
-                        activation="gelu", batch_first=True,
+                    CausalSelfAttentionBlock(
+                        d_model=n_embd, nhead=n_head
+                        #using GELU 
                     )
                 )
             else:                                # all others → Mamba
@@ -85,12 +85,10 @@ class nanoGPT(nn.Module):
         x = self.rope(x) #applying RoPE on the token embedddings
         x = x.squeeze(2).permute(1, 0, 2)
 
-        # Causal mask
-        mask = torch.triu(torch.ones(T, T, device=input_ids.device), diagonal=1).bool()
-
+       #Masking is done within the approrpriate blocks
         for block in self.blocks:
-            x = block(x, src_mask=mask, is_causal=True)
-
+           x = block(x)
+           
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
