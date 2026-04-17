@@ -93,7 +93,7 @@ if (LEARNING_RATE == -1):
 # Tuned config values for 99M param model on T4/P100 targeting <500 PPL
 # -----------------------------------------------------------------------------
 # I/O
-eval_interval = 200       # eval every 500 iters -- saves time vs every 50
+eval_interval = 100       # eval every 500 iters -- saves time vs every 50
 log_interval = 10         # log every 10 iters -- less console spam
 eval_iters = 50           # 50 batches per eval -- stable loss estimates
 eval_only = False         # if True, script exits right after the first eval
@@ -107,12 +107,12 @@ batch_size = 4            # micro-batch size -- safe for 99M params on 16GB T4/P
 block_size = 1024         # Defined by project specs, DO NOT CHANGE
 
 # training length
-max_iters = 2500         # ~6.5B tokens seen. Adjust down if running out of time.
+max_iters = 2000         # ~6.5B tokens seen. Adjust down if running out of time.
 grad_clip = 1.0           # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
 decay_lr = True           # whether to decay the learning rate
-warmup_iters = 150       # longer warmup for stability at this model size
+warmup_iters = 100       # longer warmup for stability at this model size
 lr_decay_iters = max_iters  # cosine decay over full training run per Chinchilla
 min_lr = 6e-5             # minimum learning rate, ~= learning_rate/10
 
