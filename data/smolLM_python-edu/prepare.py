@@ -47,8 +47,8 @@ def is_val(text):
 # Load dataset (STREAMING)
 # ---------------------------
 dataset = load_dataset(
-    "HuggingFaceTB/smollm-corpus",
-    "python-edu",
+    "bigcode/the-stack-smol",
+    data_dir="data/python",
     split="train",
     streaming=True
 )
@@ -66,7 +66,7 @@ val_tokens = 0
 # Process stream
 # ---------------------------
 for example in tqdm(dataset, desc="Streaming + tokenizing"):
-    text = example["text"]
+    text = example["content"]
 
     # tokenize
     ids = enc.encode(text)
