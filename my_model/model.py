@@ -11,29 +11,118 @@ MODEL_STATE_DICT = "model_state_dict"
 OPTIMIZER_STATE_DICT = "optimizer_state_dict"
 CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
+
+# --- Mixture of Experts (MoE) Components ---
+class Expert(nn.Module):
+    """A standard feed-forward network (MLP) acting as a single expert."""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.GELU(),
+            nn.Linear(4 * n_embd, n_embd),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class SparseMoE(nn.Module):
+    """Routes tokens to the Top-K experts."""
+    def __init__(self, n_embd, num_experts, top_k):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = nn.Linear(n_embd, num_experts, bias=False)
+        self.experts = nn.ModuleList([Expert(n_embd) for _ in range(num_experts)])
+
+    def forward(self, x):
+        B, T, C = x.shape
+        # 1. Get routing probabilities
+        router_logits = self.router(x) 
+        routing_weights = F.softmax(router_logits, dim=-1)
+        
+        # 2. Select Top-K experts
+        top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True) # Normalize
+        
+        # 3. Route tokens
+        flat_x = x.view(-1, C)
+        flat_indices = top_k_indices.view(-1, self.top_k)
+        flat_weights = top_k_weights.view(-1, self.top_k)
+        flat_output = torch.zeros_like(flat_x)
+        
+        for i, expert in enumerate(self.experts):
+            expert_mask = (flat_indices == i)
+            if expert_mask.any():
+                token_indices = expert_mask.any(dim=-1)
+                expert_inputs = flat_x[token_indices]
+                expert_outputs = expert(expert_inputs)
+                
+                # Apply weights
+                weights = flat_weights[token_indices][expert_mask[token_indices]].unsqueeze(-1)
+                flat_output[token_indices] += expert_outputs * weights
+                
+        return flat_output.view(B, T, C)
+
+class CausalSelfAttention(nn.Module):
+    """Standard Multi-Head Attention using efficient Flash Attention."""
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        
+        # F.scaled_dot_product_attention natively handles the causal mask
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
+
+class MoEBlock(nn.Module):
+    """Replaces nn.TransformerEncoderLayer. Combines Attention and MoE."""
+    def __init__(self, n_embd, n_head, num_experts, top_k):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head)
+        self.ln_2 = nn.LayerNorm(n_embd)
+        self.moe = SparseMoE(n_embd, num_experts, top_k)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.moe(self.ln_2(x))
+        return x
+    
+# --- Main Model ---
 class nanoGPT(nn.Module):
     def __init__(self, model_folder_name:str, chkpt_folder_name:str=None, 
-                 author:str="N/A", # Metadata args
-                 vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
+                 author:str="N/A", 
+                 vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024,
+                 num_experts=8, top_k=2): # Added MoE params
         # Model : Tokens -> Transformer Block(TB) -> TB -> ... -> TB -> Vocab Projection -> Logits
         # TB    : Input -> Multi headed attention(MHA) -> Residual_Add -> Normalization -> MLP(2 linear layers) -> Residual_Add -> Normalization -> hidden rep.
         # AF    : Non-linear function applied to a given input that outputs the same shape, IN(R,C): AF(IN) -> OUT(R,C)
         # MLP   : Linear layer(LL_0) -> AF -> LL_1
         # LL_0  : (d_feedforward X d_model) matrix of weights
         # LL_1  : (d_model X d_feedforward) matrix of weights
-
+        
         super().__init__()
         self.block_size = block_size
         self.token_emb = nn.Embedding(vocab_size, n_embd)
         self.pos_emb = nn.Embedding(block_size, n_embd)
+        
+        # custom MoE blocks
         self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=n_embd, nhead=n_head,
-                dim_feedforward=4 * n_embd, dropout=0.1,
-                activation="gelu", batch_first=True,
-            )
-            for _ in range(n_layer)
+            MoEBlock(n_embd, n_head, num_experts, top_k) for _ in range(n_layer)
         ])
+        
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight # set the output and input token embeddings to be the same as it can save parameters without losing much accuracy
@@ -43,6 +132,10 @@ class nanoGPT(nn.Module):
         self.n_head = n_head
         self.n_embd = n_embd
         self.block_size = block_size
+
+        # MoE params
+        self.num_experts = num_experts
+        self.top_k = top_k
 
         self.num_parameters = sum(val.numel() for val in self.parameters())
         self.author = author
@@ -69,11 +162,11 @@ class nanoGPT(nn.Module):
         pos_emb = self.pos_emb(torch.arange(T, device=input_ids.device))
         x = tok_emb + pos_emb
 
-        # Causal mask
-        mask = torch.triu(torch.ones(T, T, device=input_ids.device), diagonal=1).bool()
+        # mask removed, handled in CausalSelfAttention
+        # mask = torch.triu(torch.ones(T, T, device=input_ids.device), diagonal=1).bool()
 
         for block in self.blocks:
-            x = block(x, src_mask=mask, is_causal=True)
+            x = block(x)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -81,16 +174,9 @@ class nanoGPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        # else:
-        #     # inference-time mini-optimization: only forward the lm_head on the very last position
-        #     logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-        #     loss = None
-
-        # Evaluation return path, only expects logits
-        if (targets is None):
-            return logits
-        # Training return path, wants logits and loss with respect to a target for simplicitly
-        return logits, loss
+            return logits, loss
+            
+        return logits
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
@@ -122,7 +208,9 @@ class nanoGPT(nn.Module):
                 "n_embd": self.n_embd,
                 "n_head": self.n_head,
                 "n_layer": self.n_layer,
-                "block_size": self.block_size
+                "block_size": self.block_size,
+                "num_experts": self.num_experts, # added
+                "top_k": self.top_k              # added
             },
             OPT_CONFIG:{
                 "weight_decay":self.opt_weight_decay,
@@ -165,10 +253,9 @@ class nanoGPT(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
         return optimizer
 
+# --- Helper Functions ---
 def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
     model_args = [model_folder_name, chkpt_folder_name]
     model_saved_config = checkpoint[MODEL_CONFIG]

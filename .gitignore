@@ -211,3 +211,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# uv specific
+.python-version
+pyproject.toml
+uv.lock
