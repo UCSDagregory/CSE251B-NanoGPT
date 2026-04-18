@@ -1,9 +1,9 @@
 {
     "author": "Some Body",
     "vocab_size": 50257,
-    "n_embd": 160,
-    "n_head": 8,
-    "n_layer": 5,
+    "n_embd": 192,
+    "n_head": 6,
+    "n_layer": 3,
     "block_size": 1024,
     "dropout": 0
 }
