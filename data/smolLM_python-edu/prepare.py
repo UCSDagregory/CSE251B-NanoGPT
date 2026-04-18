@@ -1,6 +1,14 @@
 import os
 from pathlib import Path
+import numpy as np
+import tiktoken
+from datasets import load_dataset
+from tqdm import tqdm
+import hashlib
 
+# ---------------------------
+# Setup directories
+# ---------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 HF_ROOT = SCRIPT_DIR / "hf_cache"
@@ -17,66 +25,72 @@ os.environ["HF_HUB_CACHE"] = str(HF_HUB)
 os.environ["TMP"] = str(TMP_DIR)
 os.environ["TEMP"] = str(TMP_DIR)
 
-from tqdm import tqdm
-import numpy as np
-import tiktoken
-from datasets import load_dataset
+# ---------------------------
+# Output files
+# ---------------------------
+train_file = SCRIPT_DIR / "train.bin"
+val_file = SCRIPT_DIR / "val.bin"
 
-num_proc = 8
-num_proc_load_dataset = num_proc
-
+# ---------------------------
+# Tokenizer
+# ---------------------------
 enc = tiktoken.get_encoding("gpt2")
 
-if __name__ == '__main__':
-    dataset = load_dataset(
-        "HuggingFaceTB/smollm-corpus",
-        "python-edu",
-        num_proc=num_proc_load_dataset,
-        cache_dir=str(HF_DATASETS),
-        streaming=True
-    )
+# ---------------------------
+# Deterministic split function
+# ---------------------------
+def is_val(text):
+    h = int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
+    return h % 2000 == 0   # ≈0.05% validation
 
-    """##USE THIS TO Look at datatype
-    ds = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu", split="train[:1]")
-    print(ds.column_names)"""
+# ---------------------------
+# Load dataset (STREAMING)
+# ---------------------------
+dataset = load_dataset(
+    "HuggingFaceTB/smollm-corpus",
+    "python-edu",
+    split="train",
+    streaming=True
+)
 
-    split_dataset = dataset["train"].train_test_split(
-        test_size=0.0005, seed=2357, shuffle=True
-    )
-    split_dataset["val"] = split_dataset.pop("test")
+# ---------------------------
+# Open output files
+# ---------------------------
+train_f = open(train_file, "wb")
+val_f = open(val_file, "wb")
 
-    def process(example):
-        ids = enc.encode_ordinary(example["text"])
-        ids.append(enc.eot_token)
-        return {"ids": ids, "len": len(ids)}
+train_tokens = 0
+val_tokens = 0
 
-    tokenized = split_dataset.map(
-        process,
-        remove_columns=["text"],
-        desc="tokenizing the splits",
-        num_proc=num_proc,
-    )
+# ---------------------------
+# Process stream
+# ---------------------------
+for example in tqdm(dataset, desc="Streaming + tokenizing"):
+    text = example["text"]
 
-    for split, dset in tokenized.items():
-        arr_len = np.sum(dset["len"], dtype=np.uint64)
-        filename = SCRIPT_DIR / f"{split}.bin"
-        dtype = np.uint16
-        arr = np.memmap(filename, dtype=dtype, mode="w+", shape=(arr_len,))
-        total_batches = 1024
+    # tokenize
+    ids = enc.encode(text)
+    ids.append(enc.eot_token)
 
-        idx = 0
-        for batch_idx in tqdm(range(total_batches), desc=f"writing {filename}"):
-            batch = dset.shard(
-                num_shards=total_batches,
-                index=batch_idx,
-                contiguous=True
-            ).with_format("numpy")
-            arr_batch = np.concatenate(batch["ids"])
-            arr[idx: idx + len(arr_batch)] = arr_batch
-            idx += len(arr_batch)
+    arr = np.array(ids, dtype=np.uint32)
 
-        arr.flush()
+    # split
+    if is_val(text):
+        arr.tofile(val_f)
+        val_tokens += len(arr)
+    else:
+        arr.tofile(train_f)
+        train_tokens += len(arr)
 
-    for split in ("train", "val"):
-        m = np.memmap(SCRIPT_DIR / f"{split}.bin", dtype=np.uint16, mode="r")
-        print(f"{split} has {len(m):,} tokens")
+# ---------------------------
+# Cleanup
+# ---------------------------
+train_f.close()
+val_f.close()
+
+# ---------------------------
+# Final counts
+# ---------------------------
+print(f"train has {train_tokens:,} tokens")
+print(f"val has {val_tokens:,} tokens")
+print(f"total tokens: {train_tokens + val_tokens:,}")
