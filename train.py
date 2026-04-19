@@ -35,7 +35,8 @@ import json
 
 TRAIN_HELPER_FILENAME = "train_helper.py"
 OPT_FILENAME = "training_opt_params.json"
-LEARNING_RATE = -1
+LEARNING_RATE = None
+OPT_TYPE = "adam"
 
 # Example to resume training from a checkpoint
 # python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
@@ -45,12 +46,14 @@ LEARNING_RATE = -1
 
 def parseOptParams(file_path):
     global LEARNING_RATE
+    global OPT_TYPE
     args = []
     with open(file_path, 'r') as file:
         data = json.load(file)
         for key in data:
             args.append(data[key])
         LEARNING_RATE = data['learning_rate']
+        OPT_TYPE = data['optimizer']
     return args
 
 parser = argparse.ArgumentParser()
@@ -86,10 +89,8 @@ if (arg_opt_path is None):
     arg_opt_path = OPT_FILENAME
 opt_path = os.path.join(model_path, arg_opt_path)
 parsed_opt_args = parseOptParams(opt_path)
-if (LEARNING_RATE == -1):
+if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
-
-
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -104,8 +105,8 @@ eval_iters = 5 # How many times to calculate val.loss per 'eval interval'
 # eval_iters = 2
 eval_only = False # if True, script exits right after the first eval
 # always_save_checkpoint = False # if True, always save a checkpoint after each eval
-# iters_per_checkpoint = 50
-iters_per_checkpoint = 250
+iters_per_checkpoint = 10
+# iters_per_checkpoint = 250
 max_checkpoints_to_keep = 50
 
 # # wandb logging
@@ -182,42 +183,12 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
-# data_dir = os.path.join('data', dataset)
-
-# data_dir = os.path.join(os.getcwd(), dataset)
-# def get_batch(split):
-#     # We recreate np.memmap every batch to avoid a memory leak, as per
-#     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-#     if split == 'train':
-#         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-#     else:
-#         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-#     ix = torch.randint(len(data) - block_size, (batch_size,))
-#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-#     if device_type == 'cuda':
-#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-#     else:
-#         x, y = x.to(device), y.to(device)
-#     return x, y
-
 data_dir = os.path.join(os.getcwd(), dataset)
 batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
-
-# attempt to derive vocab_size from the dataset
-# meta_path = os.path.join(data_dir, 'meta.pkl')
-# meta_vocab_size = None
-# if os.path.exists(meta_path):
-#     with open(meta_path, 'rb') as f:
-#         meta = pickle.load(f)
-#     meta_vocab_size = meta['vocab_size']
-#     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -240,14 +211,7 @@ elif init_from == 'resume':
 else:
     raise ValueError("Unknown input for --type")
 
-# if block_size < model.config.block_size:
-#     model.crop_block_size(block_size)
-#     model_args['block_size'] = block_size # so that the checkpoint will have the right value
-
-# model.to(device)
-
 # initialize a GradScaler. If enabled=False scaler is a no-op
-# scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # wrap model into DDP container
@@ -271,20 +235,46 @@ def estimate_loss():
     model.train()
     return out
 
-# learning rate decay scheduler (cosine with warmup)
-# LEARNING_RATE comes from the passed in optimizer parameters.json file
 def get_lr(it):
+
+    if OPT_TYPE == "adam":
+        adam_base_lr = LEARNING_RATE
+    else:
+        hidden_base_lr, nonhidden_base_lr = LEARNING_RATE
+
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return LEARNING_RATE * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
+        warmup_scale = (it + 1) / (warmup_iters + 1)
+
+        if OPT_TYPE == "adam":
+            return adam_base_lr * warmup_scale
+
+        return [
+            hidden_base_lr * warmup_scale,
+            nonhidden_base_lr * warmup_scale,
+        ]
+
+    # 2) if it > lr_decay_iters, return min learning rate(s)
     if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
+        if OPT_TYPE == "adam":
+            return min_lr
+
+        return [
+            LEARNING_RATE[0],
+            LEARNING_RATE[1],
+        ]
+
+    # 3) in between, use cosine decay down to min learning rate(s)
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (LEARNING_RATE - min_lr)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+
+    if OPT_TYPE == "adam":
+        return min_lr + coeff * (adam_base_lr - min_lr)
+
+    hidden_lr = LEARNING_RATE[0] + coeff * (hidden_base_lr - LEARNING_RATE[1])
+    nonhidden_lr = LEARNING_RATE[1] + coeff * (nonhidden_base_lr - LEARNING_RATE[1])
+    return [hidden_lr, nonhidden_lr]
 
 # training loop
 X, Y = batch_helper.get_batch('train') # fetch the very first batch
@@ -299,8 +289,17 @@ current_checkpoints = len(os.listdir(model_checkpoint_path))
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    # lr = get_lr(iter_num)
+
+    if OPT_TYPE == "adam":
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+    elif OPT_TYPE == "muon":
+        hidden_lr, nonhidden_lr = lr
+        optimizer.param_groups[0]["lr"] = hidden_lr
+        optimizer.param_groups[1]["lr"] = nonhidden_lr
+    else:
+        raise ValueError("Something is incorrect with learning rate or optimizer type. Adam is a single scalar: ..., Muon is a list: [...]")
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
