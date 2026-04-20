@@ -36,7 +36,8 @@ import json
 
 TRAIN_HELPER_FILENAME = "train_helper.py"
 OPT_FILENAME = "training_opt_params.json"
-LEARNING_RATE = -1
+LEARNING_RATE = None
+OPT_TYPE = "adam"
 
 # Example to resume training from a checkpoint
 # python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
@@ -45,13 +46,15 @@ LEARNING_RATE = -1
 # python train.py --device cuda --type scratch --folder my_model --data_fd_name data/shakespeare_char
 
 def parseOptParams(file_path):
-    global LEARNING_RATE  # <-- BUG FIX: must be global or the check on line 86 always fails
+    global LEARNING_RATE
+    global OPT_TYPE
     args = []
     with open(file_path, 'r') as file:
         data = json.load(file)
         for key in data:
             args.append(data[key])
         LEARNING_RATE = data['learning_rate']
+        OPT_TYPE = data['optimizer']
     return args
 
 parser = argparse.ArgumentParser()
@@ -84,7 +87,7 @@ if (arg_opt_path is None):
     arg_opt_path = OPT_FILENAME
 opt_path = os.path.join(model_path, arg_opt_path)
 parsed_opt_args = parseOptParams(opt_path)
-if (LEARNING_RATE == -1):
+if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
 
@@ -233,14 +236,35 @@ def estimate_loss():
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
+    if OPT_TYPE == "adam":
+        adam_base_lr = LEARNING_RATE
+    else:
+        hidden_base_lr, nonhidden_base_lr = LEARNING_RATE
+
+    # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return LEARNING_RATE * (it + 1) / (warmup_iters + 1)
+        warmup_scale = (it + 1) / (warmup_iters + 1)
+        if OPT_TYPE == "adam":
+            return adam_base_lr * warmup_scale
+        return [hidden_base_lr * warmup_scale, nonhidden_base_lr * warmup_scale]
+
+    # 2) if it > lr_decay_iters, return min learning rate(s)
     if it > lr_decay_iters:
-        return min_lr
+        if OPT_TYPE == "adam":
+            return min_lr
+        return [min_lr, min_lr]
+
+    # 3) in between, use cosine decay down to min learning rate(s)
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (LEARNING_RATE - min_lr)
+
+    if OPT_TYPE == "adam":
+        return min_lr + coeff * (adam_base_lr - min_lr)
+
+    hidden_lr = min_lr + coeff * (hidden_base_lr - min_lr)
+    nonhidden_lr = min_lr + coeff * (nonhidden_base_lr - min_lr)
+    return [hidden_lr, nonhidden_lr]
 
 # ---------------------------------------------------------------------------
 # Logging setup — CSV files saved in the model folder
@@ -274,8 +298,16 @@ current_checkpoints = len(os.listdir(model_checkpoint_path))
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+
+    if OPT_TYPE == "adam":
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+    elif OPT_TYPE == "muon":
+        hidden_lr, nonhidden_lr = lr
+        optimizer.param_groups[0]["lr"] = hidden_lr
+        optimizer.param_groups[1]["lr"] = nonhidden_lr
+    else:
+        raise ValueError(f"Unknown optimizer type: {OPT_TYPE}")
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
@@ -338,13 +370,17 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         tokens_seen = iter_num * tokens_per_iter
+
+        # Format LR for logging (scalar for adam, first element for muon)
+        lr_for_log = lr if OPT_TYPE == "adam" else lr[0]
+
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
 
         # Log train metrics
         train_log_writer.writerow([
             iter_num,
             f"{lossf:.4f}",
-            f"{lr:.6e}",
+            f"{lr_for_log:.6e}",
             f"{running_mfu:.4f}",
             f"{dt*1000:.2f}",
             tokens_seen,
@@ -371,6 +407,9 @@ training_end_time = time.time()
 total_time = training_end_time - training_start_time
 total_tokens = iter_num * tokens_per_iter
 
+# Format final LR for display
+lr_display = f"{lr:.6e}" if OPT_TYPE == "adam" else f"[{lr[0]:.6e}, {lr[1]:.6e}]"
+
 print("\n" + "="*60)
 print("TRAINING SUMMARY")
 print("="*60)
@@ -381,7 +420,8 @@ print(f"  Training time:         {total_time/3600:.2f} hours")
 print(f"  Tokens/sec:            {total_tokens/total_time:,.0f}")
 print(f"  Best val loss:         {best_val_loss:.4f}")
 print(f"  Best val PPL:          {math.exp(best_val_loss):.2f}")
-print(f"  Final learning rate:   {lr:.6e}")
+print(f"  Final learning rate:   {lr_display}")
+print(f"  Optimizer:             {OPT_TYPE}")
 print(f"  Batch size (micro):    {batch_size}")
 print(f"  Grad accum steps:      {gradient_accumulation_steps}")
 print(f"  Tokens per iter:       {tokens_per_iter:,}")

@@ -5,6 +5,7 @@ import math
 import inspect
 from torch.nn import functional as F
 from typing import Any
+from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 
 MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
@@ -37,37 +38,31 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = n_embd // n_head
         self.n_embd = n_embd
 
-        # Combined QKV projection — single matmul is faster than three separate ones
         self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        # Output projection
         self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
 
         self.attn_dropout = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-        # Causal mask buffer
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
             persistent=False,
         )
 
-        # Check if Flash Attention is available (PyTorch >= 2.0)
         self.use_flash = hasattr(F, "scaled_dot_product_attention")
 
     def forward(self, x):
         B, T, C = x.size()
 
-        # Compute Q, K, V in one shot
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
 
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
         if self.use_flash:
-            # Flash Attention — fused, memory-efficient, fast
             y = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None,
@@ -75,7 +70,6 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
             )
         else:
-            # Manual attention fallback
             scale = 1.0 / math.sqrt(self.head_dim)
             att = (q @ k.transpose(-2, -1)) * scale
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
@@ -90,7 +84,6 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """Standard GPT-2 MLP: up-project -> GELU -> down-project."""
     def __init__(self, n_embd, dropout=0.0):
         super().__init__()
         self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=False)
@@ -107,7 +100,6 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block (GPT-2 style): norm -> attn -> residual, norm -> mlp -> residual."""
     def __init__(self, n_embd, n_head, block_size, dropout=0.0):
         super().__init__()
         self.ln_1 = RMSNorm(n_embd)
@@ -145,32 +137,25 @@ class nanoGPT(nn.Module):
         self.n_head = n_head
         self.n_embd = n_embd
 
-        # --- Embeddings ---
         self.token_emb = nn.Embedding(vocab_size, n_embd)
         self.pos_emb = nn.Embedding(block_size, n_embd)
         self.drop = nn.Dropout(dropout)
 
-        # --- Transformer blocks ---
         self.blocks = nn.ModuleList([
             TransformerBlock(n_embd, n_head, block_size, dropout)
             for _ in range(n_layer)
         ])
 
-        # --- Final norm + head ---
         self.ln_f = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
-        # Weight tying: share token embedding and output projection
         self.lm_head.weight = self.token_emb.weight
 
-        # --- Init weights ---
         self.apply(self._init_weights)
-        # Scale residual projections per GPT-2 paper (1/sqrt(2*n_layer))
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
 
-        # --- Bookkeeping for train.py compatibility ---
         self.num_parameters = sum(val.numel() for val in self.parameters())
         self.author = author
         self.model_path = os.path.join(os.getcwd(), model_folder_name)
@@ -180,6 +165,7 @@ class nanoGPT(nn.Module):
         self.opt_learning_rate = 0
         self.opt_betas = 0
         self.opt_device_type = 0
+        self.opt_type = "adam"
 
         print(f"Model initialized: {self.num_parameters / 1e6:.1f}M parameters")
 
@@ -215,10 +201,6 @@ class nanoGPT(nn.Module):
         )
         return logits, loss
 
-    # ------------------------------------------------------------------
-    # Required by train.py — do not change signatures
-    # ------------------------------------------------------------------
-
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         N = self.num_parameters
         L, H, Q, T = self.n_layer, self.n_head, self.n_embd // self.n_head, self.block_size
@@ -226,7 +208,7 @@ class nanoGPT(nn.Module):
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         flops_achieved = flops_per_iter * (1.0 / dt)
-        flops_promised = 312e12  # A100 bfloat16 peak
+        flops_promised = 312e12
         return flops_achieved / flops_promised
 
     def getCheckpointPath(self):
@@ -241,12 +223,13 @@ class nanoGPT(nn.Module):
                 "n_head": self.n_head,
                 "n_layer": self.n_layer,
                 "block_size": self.block_size,
-                "dropout": 0.0,  # always save; load_model sets to 0 anyway (eval mode)
+                "dropout": 0.0,
             },
             OPT_CONFIG: {
                 "weight_decay": self.opt_weight_decay,
                 "learning_rate": self.opt_learning_rate,
                 "betas": self.opt_betas,
+                "optimizer": self.opt_type,
                 "device_type": self.opt_device_type,
             },
             MODEL_STATE_DICT: self.state_dict(),
@@ -258,17 +241,98 @@ class nanoGPT(nn.Module):
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, optimizer_type, device_type):
         self.opt_weight_decay = weight_decay
         self.opt_learning_rate = learning_rate
         self.opt_betas = betas
+        self.opt_type = optimizer_type
         self.opt_device_type = device_type
 
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
-        # Decay 2D+ params (weights); don't decay 1D params (norms, biases)
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        if optimizer_type == "muon":
+            print("Using muon optimizer")
+
+            hidden_weights = []
+            hidden_gains_biases = []
+            nonhidden_params = []
+
+            nonhidden_keywords = (
+                "embed", "embedding", "wte", "wpe",
+                "head", "lm_head", "output", "classifier",
+            )
+
+            seen = set()
+
+            for name, p in param_dict.items():
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
+
+                lname = name.lower()
+
+                if any(k in lname for k in nonhidden_keywords):
+                    nonhidden_params.append(p)
+                elif p.ndim >= 2:
+                    hidden_weights.append(p)
+                else:
+                    hidden_gains_biases.append(p)
+
+            num_hidden_weights = sum(p.numel() for p in hidden_weights)
+            num_hidden_gains_biases = sum(p.numel() for p in hidden_gains_biases)
+            num_nonhidden_params = sum(p.numel() for p in nonhidden_params)
+
+            print(f"num muon parameter tensors: {len(hidden_weights)}, with {num_hidden_weights:,} parameters")
+            print(f"num hidden gain/bias tensors: {len(hidden_gains_biases)}, with {num_hidden_gains_biases:,} parameters")
+            print(f"num nonhidden parameter tensors: {len(nonhidden_params)}, with {num_nonhidden_params:,} parameters")
+
+            hidden_lr, nonhidden_lr = learning_rate[0], learning_rate[1]
+            param_groups = [
+                dict(
+                    params=hidden_weights,
+                    use_muon=True,
+                    lr=hidden_lr,
+                    weight_decay=weight_decay,
+                ),
+                dict(
+                    params=hidden_gains_biases + nonhidden_params,
+                    use_muon=False,
+                    lr=nonhidden_lr,
+                    betas=betas,
+                    weight_decay=weight_decay,
+                ),
+            ]
+
+            use_distributed_muon = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            )
+
+            if use_distributed_muon:
+                print("Using distributed MuonWithAuxAdam")
+                optimizer = MuonWithAuxAdam(param_groups)
+            else:
+                print("Using SingleDeviceMuonWithAuxAdam")
+                optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+
+            return optimizer
+
+        # default AdamW path
+        decay_params = []
+        nodecay_params = []
+        seen = set()
+
+        for _, p in param_dict.items():
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+
+            if p.dim() >= 2:
+                decay_params.append(p)
+            else:
+                nodecay_params.append(p)
+
         optim_groups = [
             {"params": decay_params, "weight_decay": weight_decay},
             {"params": nodecay_params, "weight_decay": 0.0},
@@ -281,7 +345,12 @@ class nanoGPT(nn.Module):
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == "cuda"
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=learning_rate,
+            betas=betas,
+            **extra_args,
+        )
         print(f"using fused AdamW: {use_fused}")
         return optimizer
 
