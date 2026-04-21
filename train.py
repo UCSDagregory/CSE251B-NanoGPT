@@ -225,6 +225,12 @@ if init_from == 'scratch':
     opt_args.append(device_type)
     optimizer = model.configure_optimizers(*opt_args)
     model.to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(total_params)
+    print(trainable_params)
 
 elif init_from == 'resume':
     checkpoint_file_path = args.chpr

@@ -71,6 +71,8 @@ class nanoGPT(nn.Module):
         self.opt_betas = 0
         self.opt_device_type = 0
 
+        
+
     def forward(self, input_ids, targets=None):
         """
         Args:
