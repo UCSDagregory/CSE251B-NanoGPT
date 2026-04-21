@@ -101,7 +101,7 @@ eval_iters = 5 # How many times to calculate val.loss per 'eval interval'
 eval_only = False # if True, script exits right after the first eval
 # always_save_checkpoint = False # if True, always save a checkpoint after each eval
 # iters_per_checkpoint = 50
-iters_per_checkpoint = 250
+iters_per_checkpoint = 300
 max_checkpoints_to_keep = 50
 
 # # wandb logging
