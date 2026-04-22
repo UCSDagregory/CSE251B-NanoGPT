@@ -2,6 +2,8 @@ import torch.nn as nn
 import torch
 from mambapy.mamba import Mamba, MambaConfig
 
+
+#This grabs the relative position of each word instead of its absolute position , called RoPE
 class RotaryPositionalEmbeddings(nn.Module):
 
   def __init__(self, d: int, base: int = 10_000):
@@ -75,10 +77,10 @@ class CausalSelfAttentionBlock(nn.Module):
         # RoPE operates on each head's query/key vectors (head_dim)
         self.rope = RotaryPositionalEmbeddings(self.head_dim)
  
-        # MLP
+        # Multi Layer Perceptron
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
-            nn.GELU(), 
+            nn.GELU(), #TODO: can we do some other one here?
             nn.Linear(4 * d_model, d_model),
         )
  

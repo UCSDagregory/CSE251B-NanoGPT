@@ -98,11 +98,11 @@ if (LEARNING_RATE is None):
 # Tuned config values for 99M param model on T4/P100 targeting <500 PPL
 # -----------------------------------------------------------------------------
 # I/O
-eval_interval = 100       # eval every 500 iters -- saves time vs every 50
+eval_interval = 100       # eval every 100 iters -- saves time vs every 50
 log_interval = 10         # log every 10 iters -- less console spam
 eval_iters = 50           # 50 batches per eval -- stable loss estimates
 eval_only = False         # if True, script exits right after the first eval
-iters_per_checkpoint = 500  # save checkpoint every 2500 iters
+iters_per_checkpoint = 250  # save checkpoint every 500 iters
 max_checkpoints_to_keep = 5  # keep disk usage low
 
 # data
@@ -112,7 +112,7 @@ batch_size = 4            # micro-batch size -- safe for 99M params on 16GB T4/P
 block_size = 1024         # Defined by project specs, DO NOT CHANGE
 
 # training length
-max_iters = 2000         # ~6.5B tokens seen. Adjust down if running out of time.
+max_iters = 1000         # ~6.5B tokens seen. Adjust down if running out of time.
 grad_clip = 1.0           # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings

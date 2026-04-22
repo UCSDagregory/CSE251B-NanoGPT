@@ -31,90 +31,6 @@ class RMSNorm(nn.Module):
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (x.float() * norm).type_as(x) * self.weight
 
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd, n_head, block_size, dropout=0.0):
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.head_dim = n_embd // n_head
-        self.n_embd = n_embd
-
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
-
-        self.attn_dropout = dropout
-        self.resid_dropout = nn.Dropout(dropout)
-
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
-            persistent=False,
-        )
-
-        self.use_flash = hasattr(F, "scaled_dot_product_attention")
-
-    def forward(self, x):
-        B, T, C = x.size()
-
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-
-        if self.use_flash:
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.attn_dropout if self.training else 0.0,
-                is_causal=True,
-            )
-        else:
-            scale = 1.0 / math.sqrt(self.head_dim)
-            att = (q @ k.transpose(-2, -1)) * scale
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-            att = F.softmax(att, dim=-1)
-            if self.training and self.attn_dropout > 0:
-                att = F.dropout(att, p=self.attn_dropout)
-            y = att @ v
-
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, n_embd, dropout=0.0):
-        super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=False)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.act(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, n_embd, n_head, block_size, dropout=0.0):
-        super().__init__()
-        self.ln_1 = RMSNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)
-        self.ln_2 = RMSNorm(n_embd)
-        self.mlp = MLP(n_embd, dropout)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
-
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
@@ -140,43 +56,30 @@ class nanoGPT(nn.Module):
         self.n_embd = n_embd
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
-        #self.pos_emb = nn.Embedding(block_size, n_embd) # can use ROPE, learnable positional embedding that understands RELATIVE position
 
-
+        #Hybrid SSM + Transformer
+        attn_every = 5
         blocks = []
         for i in range(n_layer):
-            if (i + 1) % attn_every == 0:       # layer 3, 6, 9... → Transformer
+            if (i + 1) % attn_every == 0:
                 blocks.append(
-                    CausalSelfAttentionBlock(
-                        d_model=n_embd, nhead=n_head
-                        #using GELU 
-                    )
+                    CausalSelfAttentionBlock(d_model=n_embd, n_head=n_head, dropout=dropout)
                 )
-            else:                                # all others → Mamba
+            else:
                 blocks.append(
-                    MambaBlock(d_model=n_embd)
+                    MambaBlock(d_model=n_embd, dropout=dropout)
                 )
 
         self.blocks = nn.ModuleList(blocks)
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.pos_emb = nn.Embedding(block_size, n_embd)
         self.drop = nn.Dropout(dropout)
-
-        self.blocks = nn.ModuleList([
-            TransformerBlock(n_embd, n_head, block_size, dropout)
-            for _ in range(n_layer)
-        ])
-
         self.ln_f = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-
-        self.lm_head.weight = self.token_emb.weight
 
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
-        self.lm_head.weight = self.token_emb.weight # set the output and input token embeddings to be the same as it can save parameters without losing much accuracy
+        self.lm_head.weight = self.token_emb.weight  # weight tying after init
 
         #Bookkeeping parameters
         self.vocab_size = vocab_size
@@ -186,6 +89,7 @@ class nanoGPT(nn.Module):
         self.block_size = block_size
 
         self.num_parameters = sum(val.numel() for val in self.parameters())
+        print("CUSTOM TOTAL PARAMETRS: ", self.num_parameters)
         self.author = author
         self.model_path = os.path.join(os.getcwd(), model_folder_name)
         self.checkpoint_folder_name = chkpt_folder_name if chkpt_folder_name else CHECKPOINT_DEFAULT
@@ -194,10 +98,11 @@ class nanoGPT(nn.Module):
         self.opt_learning_rate = 0
         self.opt_betas = 0
         self.opt_device_type = 0
-        self.opt_type = "adam"
+        self.opt_type = "muon"
 
         print(f"Model initialized: {self.num_parameters / 1e6:.1f}M parameters")
 
+    #Set weight to normal dsitribution
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -211,14 +116,15 @@ class nanoGPT(nn.Module):
         
 
     def forward(self, input_ids, targets=None):
-        B, T = input_ids.shape
+        #B, T = input_ids.shape
         x = self.token_emb(input_ids)
 
-       #Masking is done within the approrpriate blocks
+       #Masking and forward pass is done within the approrpriate blocks
         for block in self.blocks:
            x = block(x)
            
         x = self.ln_f(x)
+        x = self.drop(x)
         logits = self.lm_head(x)
 
         if targets is not None:
@@ -284,9 +190,9 @@ class nanoGPT(nn.Module):
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, optimizer_type, device_type):
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, optimizer_type, device_type):
         self.opt_weight_decay = weight_decay
         self.opt_learning_rate = learning_rate
         self.opt_betas = betas
