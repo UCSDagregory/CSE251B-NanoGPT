@@ -36,7 +36,7 @@ import json
 TRAIN_HELPER_FILENAME = "train_helper.py"
 OPT_FILENAME = "training_opt_params.json"
 LEARNING_RATE = None
-OPT_TYPE = "adam"
+OPT_TYPE = "muon"
 
 # Example to resume training from a checkpoint
 # python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
@@ -64,6 +64,7 @@ parser.add_argument("--data_fd_name", required=True) # data_folder_name/folder_n
 parser.add_argument("--chpn", required=False) # folder_name to save checkpoints, only for from scratch init
 parser.add_argument("--chpr", required=False) # folder_name/checkpoint_file_name
 parser.add_argument("--opt_name", required=False)
+parser.add_argument("--data_collection", required=False)
 
 args = parser.parse_args()
 
@@ -98,43 +99,53 @@ if (LEARNING_RATE is None):
 # out_dir = 'checkpoints'
 
 # eval_interval = 2000
-eval_interval = 50 # How many iters until re-calculate val. loss
+eval_interval = 75 # How many iters until re-calculate val. loss
 # eval_interval = 5
 log_interval = 1
-eval_iters = 5 # How many times to calculate val.loss per 'eval interval'
-# eval_iters = 2
+eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
+# eval_iters = 5
 eval_only = False # if True, script exits right after the first eval
-# always_save_checkpoint = False # if True, always save a checkpoint after each eval
-iters_per_checkpoint = 10
-# iters_per_checkpoint = 250
-max_checkpoints_to_keep = 50
+always_save_checkpoint = True # if True, always save a checkpoint after each eval
+# iters_per_checkpoint = 5
+iters_per_checkpoint = 15
+# max_checkpoints_to_keep = 25
+max_checkpoints_to_keep = 60
 
-# # wandb logging
-# wandb_log = False # disabled by default
-# wandb_project = 'owt'
-# wandb_run_name = 'gpt2' # 'run' + str(time.time())
-
-# data
-# dataset = 'openwebtext'
 dataset = args.data_fd_name
-# gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-# gradient_accumulation_steps = 1 * 4 # used to simulate larger batch sizes
-gradient_accumulation_steps = 16 * 1 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+effective_batch_size = 96
+# Important note
+# batch_size exists to be memory efficient, if there isn't enough space in the GPU memory it will spill over into SMEM (shared memory)
+# which is significantly slower than it just living in VRAM
+# batch_size should be as large as possible, (must be >= 1) s.t. everything fits in VRAM without spilling to SMEM, which will kill performance.
+# sometimes the model is too large to all fit into VRAM which is ok, that's just the limit of the hardware
+
+# Effective_batch_size is the compensation, in order to keep the gradients sufficiently clean and free of noise, we grab a total of effective_batch_size chunks 
+# to train on from the data set, in batch_size chunks at a time. These then get sent to the GPU and the forward-backward starts.
+
+# It used to ge gradient_accumulation_steps was separate and effective_batch_size was a calculated side effect of batch_size*gradient_accumulation_steps
+# this is fine but it abstracts the reality that the number of effective batches per iteration is what matters for keeping the gradient clean.
+# It's been changed s.t. the user now fixes effective_batch_size to a number they deem reasonable for clean gradients and batch_size to ensure training is as performant as possible
+# gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
+
+# batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
+remainder = effective_batch_size%batch_size
+if (remainder > 0):
+    gradient_accumulation_steps += 1
+print(f"Gradient accumulation steps:{gradient_accumulation_steps} | Total effective batch size:{gradient_accumulation_steps*batch_size}")
 block_size = 1024 # Defined by project specs, DO NOT CHANGE
 
-# adamw optimizer (Should also come from a config file of sorts)
-max_iters = 600000 # total number of training iterations
-# learning_rate = 6e-4 # max learning rate
-# weight_decay = 1e-1
-# beta1 = 0.9
-# beta2 = 0.95
+# max_iters = 600000 # total number of training iterations
+max_iters = 10000 # total number of training iterations
+# max_iters = 1500 # total number of training iterations
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-# warmup_iters = 2000 # how many steps to warm up for
-warmup_iters = 200 # how many steps to warm up for
+# warmup_iters = 200 # how many steps to warm up for
+# warmup_iters = 25 # how many steps to warm up for
+warmup_iters = max(25,int(0.05*float(max_iters))) # how many steps to warm up for
 lr_decay_iters = int(max_iters*1.0) # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
@@ -144,7 +155,9 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 device = args.device
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+# compile = True # use PyTorch 2.0 to compile the model to be faster
+
+print(f"Maximum unique training tokens{max_iters*effective_batch_size*block_size:.2e}\n\n")
 
 # -----------------------------------------------------------------------------
 # config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -202,7 +215,8 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     checkpoint_file_path = args.chpr
     print(f"Resuming from a checkpoint:{checkpoint_file_path}")
-    model, model_sd, opt_args, opt_sd = train_helper.createModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
+    model, model_sd, opt_args, opt_sd, iter_num = train_helper.createModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
+    max_iters += iter_num
     model.load_state_dict(model_sd)
     model.to(device)
     optimizer = model.configure_optimizers(*opt_args)
@@ -236,9 +250,8 @@ def estimate_loss():
     return out
 
 def get_lr(it):
-
     if OPT_TYPE == "adam":
-        adam_base_lr = LEARNING_RATE
+        base_lr = LEARNING_RATE
     else:
         hidden_base_lr, nonhidden_base_lr = LEARNING_RATE
 
@@ -247,46 +260,48 @@ def get_lr(it):
         warmup_scale = (it + 1) / (warmup_iters + 1)
 
         if OPT_TYPE == "adam":
-            return adam_base_lr * warmup_scale
+            return base_lr * warmup_scale
 
         return [
             hidden_base_lr * warmup_scale,
             nonhidden_base_lr * warmup_scale,
         ]
 
-    # 2) if it > lr_decay_iters, return min learning rate(s)
+    # 2) if past decay horizon, clamp at min lr
     if it > lr_decay_iters:
         if OPT_TYPE == "adam":
             return min_lr
 
-        return [
-            LEARNING_RATE[0],
-            LEARNING_RATE[1],
-        ]
+        return [min_lr, min_lr]
 
-    # 3) in between, use cosine decay down to min learning rate(s)
+    # 3) cosine decay from base lr down to min lr
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
 
     if OPT_TYPE == "adam":
-        return min_lr + coeff * (adam_base_lr - min_lr)
+        return min_lr + coeff * (base_lr - min_lr)
 
-    hidden_lr = LEARNING_RATE[0] + coeff * (hidden_base_lr - LEARNING_RATE[1])
-    nonhidden_lr = LEARNING_RATE[1] + coeff * (nonhidden_base_lr - LEARNING_RATE[1])
+    hidden_lr = min_lr + coeff * (hidden_base_lr - min_lr)
+    nonhidden_lr = min_lr + coeff * (nonhidden_base_lr - min_lr)
     return [hidden_lr, nonhidden_lr]
 
 # training loop
 X, Y = batch_helper.get_batch('train') # fetch the very first batch
 t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
+local_iter_num = iter_num # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
 model_checkpoint_path = model.getCheckpointPath()
-current_checkpoints = len(os.listdir(model_checkpoint_path))
 
+lossf = 0.0
+tokens_parsed = 0.0
+print(f"Warmup iters for:{warmup_iters}\n")
 while True:
+    total_tokens_processed = iter_num*effective_batch_size*block_size
+    print(f"Tokens processed:{total_tokens_processed} | {total_tokens_processed:.2e}\n")
+
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
     # lr = get_lr(iter_num)
@@ -302,22 +317,27 @@ while True:
         raise ValueError("Something is incorrect with learning rate or optimizer type. Adam is a single scalar: ..., Muon is a list: [...]")
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num%eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-        # if losses['val'] < best_val_loss or always_save_checkpoint:
-        if losses['val'] < best_val_loss or iter_num%iters_per_checkpoint == 0:
-            best_val_loss = losses['val']
-            if iter_num >= 0:
-                print(f"Current val loss:{losses['val']:.4f}")
-                if (current_checkpoints >= max_checkpoints_to_keep):
-                    files = os.listdir(model_checkpoint_path) # pseudo sorted because the val. loss is expected to decrease with time
-                    chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
-                    print(f"Removing checkpoint: {chkpt_to_remove}")
-                    os.remove(chkpt_to_remove)
-                model.saveCheckpoint(optimizer, losses['val'])
-
+    if iter_num%iters_per_checkpoint == 0 or (iter_num%eval_interval == 0 and losses['val'] < best_val_loss):
+        best_val_loss = losses['val']
+        if iter_num >= 0:
+            print(f"Current val loss:{losses['val']:.4f}")
+            current_checkpoints = len(os.listdir(model_checkpoint_path))
+            if (current_checkpoints >= max_checkpoints_to_keep):
+                files = os.listdir(model_checkpoint_path) # pseudo sorted because the val. loss is expected to decrease with time
+                chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
+                print(f"Removing checkpoint: {chkpt_to_remove}")
+                os.remove(chkpt_to_remove)
+            if (iter_num%eval_interval == 0):
+                model.saveCheckpoint(optimizer, losses['val'], iter_num)
+            else:
+                model.saveCheckpoint(optimizer, lossf, iter_num, True)
+            if (not args.data_collection is None):
+                with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
+                    f.write(f"{total_tokens_processed},{iter_num},{lossf:.4f}\n")
     if iter_num == 0 and eval_only:
         break
 

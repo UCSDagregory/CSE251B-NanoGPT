@@ -2,6 +2,7 @@
 */*/hf_cache
 */*/tmp
 *.bin
+DG_*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

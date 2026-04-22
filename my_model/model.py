@@ -117,7 +117,7 @@ class nanoGPT(nn.Module):
 
     # file_name -> no extension, the needed one is added in the func. 
     # def saveCheckpoint(self, file_name:str, epoch:int, optimizer:nn.Module, loss:int):
-    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int):
+    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, non_eval_checkpoint=False):
         checkpoint = {
             MODEL_CONFIG: {
                 "author": self.author,
@@ -138,6 +138,9 @@ class nanoGPT(nn.Module):
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
         }
         save_file_name = f"{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+        if (non_eval_checkpoint):
+            save_file_name = f"CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
 
@@ -223,45 +226,47 @@ class nanoGPT(nn.Module):
 
             return optimizer
 
-        # default AdamW path
-        decay_params = []
-        nodecay_params = []
-        seen = set()
+        if optimizer_type == "adam":
+            # default AdamW path
+            decay_params = []
+            nodecay_params = []
+            seen = set()
 
-        for _, p in param_dict.items():
-            if id(p) in seen:
-                continue
-            seen.add(id(p))
+            for _, p in param_dict.items():
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
 
-            if p.dim() >= 2:
-                decay_params.append(p)
-            else:
-                nodecay_params.append(p)
+                if p.dim() >= 2:
+                    decay_params.append(p)
+                else:
+                    nodecay_params.append(p)
 
-        optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
-        ]
+            optim_groups = [
+                {"params": decay_params, "weight_decay": weight_decay},
+                {"params": nodecay_params, "weight_decay": 0.0},
+            ]
 
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
-        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == "cuda"
-        extra_args = dict(fused=True) if use_fused else dict()
+            fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == "cuda"
+            extra_args = dict(fused=True) if use_fused else dict()
 
-        optimizer = torch.optim.AdamW(
-            optim_groups,
-            lr=learning_rate,
-            betas=betas,
-            **extra_args,
-        )
-        print(f"using fused AdamW: {use_fused}")
+            optimizer = torch.optim.AdamW(
+                optim_groups,
+                lr=learning_rate,
+                betas=betas,
+                **extra_args,
+            )
+            print(f"using fused AdamW: {use_fused}")
 
-        return optimizer
-
+            return optimizer
+        
+        raise ValueError(f"Invalid optimizer type: {optimizer_type}")
 def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
     model_args = [model_folder_name, chkpt_folder_name]
     model_saved_config = checkpoint[MODEL_CONFIG]
