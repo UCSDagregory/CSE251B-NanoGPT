@@ -78,7 +78,7 @@ if __name__ == "__main__":
         ids = enc.encode(text)
         ids.append(enc.eot_token)
 
-        arr = np.array(ids, dtype=np.uint32)
+        arr = np.array(ids, dtype=np.uint16)
 
         # split
         if is_val(text):

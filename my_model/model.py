@@ -81,11 +81,7 @@ class nanoGPT(nn.Module):
             logits: FloatTensor of shape (batch_size, seq_len, 50257)
         """
         B, T = input_ids.shape
-        tok_emb = self.token_emb(input_ids)
-        
-        x = tok_emb.permute(1,0,2).unsqueeze(2)
-        x = self.rope(x) #applying RoPE on the token embedddings
-        x = x.squeeze(2).permute(1, 0, 2)
+        x = self.token_emb(input_ids)
 
        #Masking is done within the approrpriate blocks
         for block in self.blocks:
