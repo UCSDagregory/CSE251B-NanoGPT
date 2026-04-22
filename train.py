@@ -44,6 +44,7 @@ LEARNING_RATE = -1
 # python train.py --device cuda --type scratch --folder my_model --data_fd_name data/shakespeare_char
 
 def parseOptParams(file_path):
+    global LEARNING_RATE
     args = []
     with open(file_path, 'r') as file:
         data = json.load(file)
