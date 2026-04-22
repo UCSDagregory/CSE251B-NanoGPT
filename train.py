@@ -20,6 +20,7 @@ import os
 import time
 import math
 import pickle
+import csv
 from contextlib import nullcontext
 
 import numpy as np
@@ -33,9 +34,12 @@ import argparse
 
 import json
 
+import json
+
 TRAIN_HELPER_FILENAME = "train_helper.py"
 OPT_FILENAME = "training_opt_params.json"
-LEARNING_RATE = -1
+LEARNING_RATE = None
+OPT_TYPE = "adam"
 
 # Example to resume training from a checkpoint
 # python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
@@ -45,12 +49,14 @@ LEARNING_RATE = -1
 
 def parseOptParams(file_path):
     global LEARNING_RATE
+    global OPT_TYPE
     args = []
     with open(file_path, 'r') as file:
         data = json.load(file)
         for key in data:
             args.append(data[key])
         LEARNING_RATE = data['learning_rate']
+        OPT_TYPE = data['optimizer']
     return args
 
 parser = argparse.ArgumentParser()
@@ -83,69 +89,45 @@ if (arg_opt_path is None):
     arg_opt_path = OPT_FILENAME
 opt_path = os.path.join(model_path, arg_opt_path)
 parsed_opt_args = parseOptParams(opt_path)
-if (LEARNING_RATE == -1):
+if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
 
 
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
+# Tuned config values for 99M param model on T4/P100 targeting <500 PPL
+# -----------------------------------------------------------------------------
 # I/O
-# out_dir = 'checkpoints'
-
-# eval_interval = 2000
-eval_interval = 50 # How many iters until re-calculate val. loss
-# eval_interval = 5
-log_interval = 1
-eval_iters = 5 # How many times to calculate val.loss per 'eval interval'
-# eval_iters = 2
-eval_only = False # if True, script exits right after the first eval
-# always_save_checkpoint = False # if True, always save a checkpoint after each eval
-# iters_per_checkpoint = 50
-iters_per_checkpoint = 300
-max_checkpoints_to_keep = 50
-
-# # wandb logging
-# wandb_log = False # disabled by default
-# wandb_project = 'owt'
-# wandb_run_name = 'gpt2' # 'run' + str(time.time())
+eval_interval = 100       # eval every 500 iters -- saves time vs every 50
+log_interval = 10         # log every 10 iters -- less console spam
+eval_iters = 50           # 50 batches per eval -- stable loss estimates
+eval_only = False         # if True, script exits right after the first eval
+iters_per_checkpoint = 500  # save checkpoint every 2500 iters
+max_checkpoints_to_keep = 5  # keep disk usage low
 
 # data
-# dataset = 'openwebtext'
 dataset = args.data_fd_name
-# gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-# gradient_accumulation_steps = 1 * 4 # used to simulate larger batch sizes
-gradient_accumulation_steps = 16 * 1 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024 # Defined by project specs, DO NOT CHANGE
+gradient_accumulation_steps = 8  # effective batch = 32 * 4 * 1024 = 131,072 tokens/iter
+batch_size = 4            # micro-batch size -- safe for 99M params on 16GB T4/P100
+block_size = 1024         # Defined by project specs, DO NOT CHANGE
 
-# adamw optimizer (Should also come from a config file of sorts)
-max_iters = 600000 # total number of training iterations
-# learning_rate = 6e-4 # max learning rate
-# weight_decay = 1e-1
-# beta1 = 0.9
-# beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+# training length
+max_iters = 2000         # ~6.5B tokens seen. Adjust down if running out of time.
+grad_clip = 1.0           # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-# warmup_iters = 2000 # how many steps to warm up for
-warmup_iters = 200 # how many steps to warm up for
-lr_decay_iters = int(max_iters*1.0) # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+decay_lr = True           # whether to decay the learning rate
+warmup_iters = 100       # longer warmup for stability at this model size
+lr_decay_iters = max_iters  # cosine decay over full training run per Chinchilla
+min_lr = 6e-5             # minimum learning rate, ~= learning_rate/10
 
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-# device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 device = args.device
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+compile = False  # disable torch.compile -- avoids issues on P100 and slow compilation on T4
 
-# -----------------------------------------------------------------------------
-# config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-# exec(open('configurator.py').read()) # overrides from command line or config file
-# config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
@@ -180,7 +162,6 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-# data_dir = os.path.join('data', dataset)
 data_dir = os.path.join(os.getcwd(), dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -193,7 +174,6 @@ def get_batch(split):
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
@@ -203,35 +183,13 @@ def get_batch(split):
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
-# meta_path = os.path.join(data_dir, 'meta.pkl')
-# meta_vocab_size = None
-# if os.path.exists(meta_path):
-#     with open(meta_path, 'rb') as f:
-#         meta = pickle.load(f)
-#     meta_vocab_size = meta['vocab_size']
-#     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
 if init_from == 'scratch':
-    # init a new model from scratch
     print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    # if meta_vocab_size is None:
-    #     print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    # model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     model = train_helper.createModel(model_folder_name, None, chkpt_folder_name_init)
-    # optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-    # opt_args = parsed_opt_args.append(device_type)
     opt_args = parsed_opt_args
     opt_args.append(device_type)
     optimizer = model.configure_optimizers(*opt_args)
     model.to(device)
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print(total_params)
-    print(trainable_params)
 
 elif init_from == 'resume':
     checkpoint_file_path = args.chpr
@@ -242,26 +200,20 @@ elif init_from == 'resume':
     optimizer = model.configure_optimizers(*opt_args)
     optimizer.load_state_dict(opt_sd)
 
-# elif init_from.startswith('gpt2'):
-#     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-#     # initialize from OpenAI GPT-2 weights
-#     override_args = dict(dropout=dropout)
-#     model = GPT.from_pretrained(init_from, override_args)
-#     # read off the created config params, so we can store them into checkpoint correctly
-#     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-#         model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
 else:
     raise ValueError("Unknown input for --type")
 
-# if block_size < model.config.block_size:
-#     model.crop_block_size(block_size)
-#     model_args['block_size'] = block_size # so that the checkpoint will have the right value
-
-# model.to(device)
+# --- Parameter count check (competition limit: 100M) ---
+MAX_PARAMS = 100_000_000
+n_params = sum(p.numel() for p in model.parameters())
+print(f"Total model parameters: {n_params:,}")
+if n_params > MAX_PARAMS:
+    raise ValueError(
+        f"Model has {n_params:,} parameters, exceeding the {MAX_PARAMS:,} limit. "
+        f"Reduce n_embd, n_layer, or n_head in training_model_params.json."
+    )
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-# scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # wrap model into DDP container
@@ -276,7 +228,6 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            print(f"Loss({k}) estimate")
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
@@ -288,23 +239,60 @@ def estimate_loss():
 # learning rate decay scheduler (cosine with warmup)
 # LEARNING_RATE comes from the passed in optimizer parameters.json file
 def get_lr(it):
+    if OPT_TYPE == "adam":
+        adam_base_lr = LEARNING_RATE
+    else:
+        hidden_base_lr, nonhidden_base_lr = LEARNING_RATE
+
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        return LEARNING_RATE * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
+        warmup_scale = (it + 1) / (warmup_iters + 1)
+        if OPT_TYPE == "adam":
+            return adam_base_lr * warmup_scale
+        return [hidden_base_lr * warmup_scale, nonhidden_base_lr * warmup_scale]
+
+    # 2) if it > lr_decay_iters, return min learning rate(s)
     if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
+        if OPT_TYPE == "adam":
+            return min_lr
+        return [min_lr, min_lr]
+
+    # 3) in between, use cosine decay down to min learning rate(s)
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (LEARNING_RATE - min_lr)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+
+    if OPT_TYPE == "adam":
+        return min_lr + coeff * (adam_base_lr - min_lr)
+
+    hidden_lr = min_lr + coeff * (hidden_base_lr - min_lr)
+    nonhidden_lr = min_lr + coeff * (nonhidden_base_lr - min_lr)
+    return [hidden_lr, nonhidden_lr]
+
+# ---------------------------------------------------------------------------
+# Logging setup — CSV files saved in the model folder
+# ---------------------------------------------------------------------------
+log_dir = model_path
+train_log_path = os.path.join(log_dir, "train_log.csv")
+eval_log_path = os.path.join(log_dir, "eval_log.csv")
+
+# Per-iteration log
+train_log_file = open(train_log_path, "w", newline="")
+train_log_writer = csv.writer(train_log_file)
+train_log_writer.writerow(["iter", "train_loss", "lr", "mfu", "dt_ms", "tokens_seen"])
+
+# Per-eval log
+eval_log_file = open(eval_log_path, "w", newline="")
+eval_log_writer = csv.writer(eval_log_file)
+eval_log_writer.writerow(["iter", "train_loss", "val_loss", "train_ppl", "val_ppl", "tokens_seen"])
+
+training_start_time = time.time()
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+local_iter_num = 0
+raw_model = model.module if ddp else model
 running_mfu = -1.0
 
 model_checkpoint_path = model.getCheckpointPath()
@@ -312,22 +300,44 @@ current_checkpoints = len(os.listdir(model_checkpoint_path))
 
 while True:
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
+
+    if OPT_TYPE == "adam":
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+    elif OPT_TYPE == "muon":
+        hidden_lr, nonhidden_lr = lr
+        optimizer.param_groups[0]["lr"] = hidden_lr
+        optimizer.param_groups[1]["lr"] = nonhidden_lr
+    else:
+        raise ValueError(f"Unknown optimizer type: {OPT_TYPE}")
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        train_ppl = math.exp(losses['train'])
+        val_ppl = math.exp(losses['val'])
+        tokens_seen = iter_num * tokens_per_iter
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, "
+              f"train ppl {train_ppl:.1f}, val ppl {val_ppl:.1f}")
 
-        # if losses['val'] < best_val_loss or always_save_checkpoint:
+        # Log eval metrics
+        eval_log_writer.writerow([
+            iter_num,
+            f"{losses['train']:.4f}",
+            f"{losses['val']:.4f}",
+            f"{train_ppl:.2f}",
+            f"{val_ppl:.2f}",
+            tokens_seen,
+        ])
+        eval_log_file.flush()
+
         if losses['val'] < best_val_loss or iter_num%iters_per_checkpoint == 0:
             best_val_loss = losses['val']
             if iter_num >= 0:
                 print(f"Current val loss:{losses['val']:.4f}")
                 if (current_checkpoints >= max_checkpoints_to_keep):
-                    files = os.listdir(model_checkpoint_path) # pseudo sorted because the val. loss is expected to decrease with time
+                    files = os.listdir(model_checkpoint_path)
                     chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
                     print(f"Removing checkpoint: {chkpt_to_remove}")
                     os.remove(chkpt_to_remove)
@@ -336,31 +346,21 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
+    # forward backward update, with optional gradient accumulation
     for micro_step in range(gradient_accumulation_steps):
-        print(f"Microstep:{micro_step}\n")
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            loss = loss / gradient_accumulation_steps
         X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
@@ -368,19 +368,159 @@ while True:
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
+        if local_iter_num >= 5:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        tokens_seen = iter_num * tokens_per_iter
+
+        # Format LR for logging (scalar for adam, first element for muon)
+        lr_for_log = lr if OPT_TYPE == "adam" else lr[0]
+
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+        # Log train metrics
+        train_log_writer.writerow([
+            iter_num,
+            f"{lossf:.4f}",
+            f"{lr_for_log:.6e}",
+            f"{running_mfu:.4f}",
+            f"{dt*1000:.2f}",
+            tokens_seen,
+        ])
+        train_log_file.flush()
+
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
     if iter_num > max_iters:
         break
+
+# ---------------------------------------------------------------------------
+# Close log files
+# ---------------------------------------------------------------------------
+train_log_file.close()
+eval_log_file.close()
+
+# ---------------------------------------------------------------------------
+# Print summary table
+# ---------------------------------------------------------------------------
+training_end_time = time.time()
+total_time = training_end_time - training_start_time
+total_tokens = iter_num * tokens_per_iter
+
+# Format final LR for display
+lr_display = f"{lr:.6e}" if OPT_TYPE == "adam" else f"[{lr[0]:.6e}, {lr[1]:.6e}]"
+
+print("\n" + "="*60)
+print("TRAINING SUMMARY")
+print("="*60)
+print(f"  Model parameters:      {n_params:,}")
+print(f"  Total iterations:      {iter_num:,}")
+print(f"  Total tokens seen:     {total_tokens:,}")
+print(f"  Training time:         {total_time/3600:.2f} hours")
+print(f"  Tokens/sec:            {total_tokens/total_time:,.0f}")
+print(f"  Best val loss:         {best_val_loss:.4f}")
+print(f"  Best val PPL:          {math.exp(best_val_loss):.2f}")
+print(f"  Final learning rate:   {lr_display}")
+print(f"  Optimizer:             {OPT_TYPE}")
+print(f"  Batch size (micro):    {batch_size}")
+print(f"  Grad accum steps:      {gradient_accumulation_steps}")
+print(f"  Tokens per iter:       {tokens_per_iter:,}")
+print(f"  Device:                {device}")
+print(f"  Dtype:                 {dtype}")
+print("="*60)
+
+# ---------------------------------------------------------------------------
+# Generate plots
+# ---------------------------------------------------------------------------
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # non-interactive backend for headless servers
+    import matplotlib.pyplot as plt
+
+    # --- Read eval CSV ---
+    eval_iters_list, eval_train_loss, eval_val_loss = [], [], []
+    eval_train_ppl, eval_val_ppl = [], []
+    with open(eval_log_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            eval_iters_list.append(int(row["iter"]))
+            eval_train_loss.append(float(row["train_loss"]))
+            eval_val_loss.append(float(row["val_loss"]))
+            eval_train_ppl.append(float(row["train_ppl"]))
+            eval_val_ppl.append(float(row["val_ppl"]))
+
+    # --- Read train CSV ---
+    train_iters_list, train_loss_list, lr_list, mfu_list = [], [], [], []
+    with open(train_log_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            train_iters_list.append(int(row["iter"]))
+            train_loss_list.append(float(row["train_loss"]))
+            lr_list.append(float(row["lr"]))
+            mfu_list.append(float(row["mfu"]))
+
+    # --- Figure 1: Train & Val Loss ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(train_iters_list, train_loss_list, alpha=0.3, label="Train loss (per iter)", color="blue")
+    ax.plot(eval_iters_list, eval_train_loss, 'o-', label="Train loss (eval)", color="blue", markersize=3)
+    ax.plot(eval_iters_list, eval_val_loss, 'o-', label="Val loss (eval)", color="red", markersize=3)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Loss (cross-entropy)")
+    ax.set_title("Training & Validation Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(log_dir, "loss_curve.png"), dpi=150)
+    print(f"Saved: {os.path.join(log_dir, 'loss_curve.png')}")
+
+    # --- Figure 2: Val PPL ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(eval_iters_list, eval_val_ppl, 'o-', label="Val PPL", color="red", markersize=3)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Perplexity")
+    ax.set_title("Validation Perplexity")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(log_dir, "val_ppl_curve.png"), dpi=150)
+    print(f"Saved: {os.path.join(log_dir, 'val_ppl_curve.png')}")
+
+    # --- Figure 3: Learning Rate Schedule ---
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(train_iters_list, lr_list, color="green")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Learning Rate")
+    ax.set_title("Learning Rate Schedule (Warmup + Cosine Decay)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(log_dir, "lr_schedule.png"), dpi=150)
+    print(f"Saved: {os.path.join(log_dir, 'lr_schedule.png')}")
+
+    # --- Figure 4: MFU ---
+    fig, ax = plt.subplots(figsize=(10, 4))
+    valid = [(i, m) for i, m in zip(train_iters_list, mfu_list) if m > 0]
+    if valid:
+        ax.plot([x[0] for x in valid], [x[1]*100 for x in valid], color="purple")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("MFU (%)")
+    ax.set_title("Model FLOPs Utilization")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(log_dir, "mfu_curve.png"), dpi=150)
+    print(f"Saved: {os.path.join(log_dir, 'mfu_curve.png')}")
+
+    plt.close('all')
+    print("\nAll plots saved successfully.")
+
+except ImportError:
+    print("\nmatplotlib not installed -- skipping plot generation.")
+    print("Install with: pip install matplotlib")
+except Exception as e:
+    print(f"\nPlot generation failed: {e}")
+    print("CSV logs are still available for manual plotting.")
 
 if ddp:
     destroy_process_group()
