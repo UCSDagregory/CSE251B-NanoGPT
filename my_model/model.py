@@ -31,6 +31,7 @@ class RMSNorm(nn.Module):
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (x.float() * norm).type_as(x) * self.weight
 
+
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------

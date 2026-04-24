@@ -45,8 +45,8 @@ if __name__ == "__main__":
     dataset = load_dataset(
         "HuggingFaceTB/smollm-corpus",
         "fineweb-edu-dedup",
-        split="train",        # ✅ required for streaming
-        streaming=True        # ✅ required
+        split="train",        
+        streaming=True        
     )
 
     train_path = SCRIPT_DIR / "train.bin"

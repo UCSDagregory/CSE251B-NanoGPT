@@ -143,10 +143,11 @@ class MambaBlock(nn.Module):
                  expand: int = 2, dropout: float = 0.1):
         super().__init__()
         self.norm  = nn.LayerNorm(d_model)
+        self.silu = nn.SiLU()
         cfg        = MambaConfig(d_model=d_model, n_layers=1,
                                  d_state=d_state, d_conv=d_conv, expand_factor=expand)
         self.mamba = Mamba(cfg)   # mambapy wraps the full model; we use 1-layer
         self.drop  = nn.Dropout(dropout)
 
     def forward(self, x):
-        return x + self.drop(self.mamba(self.norm(x)))
+        return x + self.drop(self.mamba(self.silu(self.norm(x))))
