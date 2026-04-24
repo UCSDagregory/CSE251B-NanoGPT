@@ -93,11 +93,6 @@ parsed_opt_args = parseOptParams(opt_path)
 if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-# out_dir = 'checkpoints'
-
 # eval_interval = 2000
 eval_interval = 75 # How many iters until re-calculate val. loss
 # eval_interval = 5
@@ -297,6 +292,8 @@ model_checkpoint_path = model.getCheckpointPath()
 
 lossf = 0.0
 tokens_parsed = 0.0
+losses = {}
+losses['val'] = 999.0
 print(f"Warmup iters for:{warmup_iters}\n")
 while True:
     total_tokens_processed = iter_num*effective_batch_size*block_size
@@ -328,16 +325,19 @@ while True:
             current_checkpoints = len(os.listdir(model_checkpoint_path))
             if (current_checkpoints >= max_checkpoints_to_keep):
                 files = os.listdir(model_checkpoint_path) # pseudo sorted because the val. loss is expected to decrease with time
-                chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
+                # chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
+                chkpt_to_remove = os.path.join(model_checkpoint_path, files[0]) # we remove the first since we store the iter num in the file name now since it's a better indicator of performance
                 print(f"Removing checkpoint: {chkpt_to_remove}")
                 os.remove(chkpt_to_remove)
+            # model.saveCheckpoint(optimizer, losses['val'], iter_num)
             if (iter_num%eval_interval == 0):
                 model.saveCheckpoint(optimizer, losses['val'], iter_num)
             else:
-                model.saveCheckpoint(optimizer, lossf, iter_num, True)
-            if (not args.data_collection is None):
-                with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
-                    f.write(f"{total_tokens_processed},{iter_num},{lossf:.4f}\n")
+                model.saveCheckpoint(optimizer, lossf, iter_num)
+            # if (not args.data_collection is None):
+            # Just save to training data as a default
+            with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
+                f.write(f"{total_tokens_processed},{iter_num},{lossf:.4f}\n")
     if iter_num == 0 and eval_only:
         break
 
