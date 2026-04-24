@@ -1,10 +1,15 @@
 import os
+import itertools
 from pathlib import Path
 import numpy as np
 import tiktoken
 from datasets import load_dataset
 from tqdm import tqdm
 import hashlib
+
+# Adjust this to fit within Kaggle's session time (~9 hrs).
+# cosmopedia-v2 has ~39M docs; 1M gives ~2-4B tokens depending on doc length.
+MAX_EXAMPLES = 1_000_000
 
 # ---------------------------
 # Setup paths (your original is fine)
@@ -62,7 +67,7 @@ if __name__ == "__main__":
     # ---------------------------
     # streaming loop
     # ---------------------------
-    for example in tqdm(dataset, desc="Streaming + tokenizing"):
+    for example in tqdm(itertools.islice(dataset, MAX_EXAMPLES), total=MAX_EXAMPLES, desc="Streaming + tokenizing"):
 
         # 🔍 handle unknown schema safely
         if "text" in example:

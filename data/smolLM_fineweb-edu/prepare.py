@@ -1,11 +1,13 @@
 import os
 from pathlib import Path
+import itertools
 import numpy as np
 import tiktoken
 from datasets import load_dataset
 from tqdm import tqdm
 import hashlib
 
+MAX_EXAMPLES = 1_500_000
 # ---------------------------
 # Setup directories (unchanged)
 # ---------------------------
@@ -58,9 +60,8 @@ if __name__ == "__main__":
     train_tokens = 0
     val_tokens = 0
 
-    for example in tqdm(dataset, desc="Streaming + tokenizing"):
+    for example in tqdm(itertools.islice(dataset, MAX_EXAMPLES), total=MAX_EXAMPLES, desc="Streaming + tokenizing"):
 
-        # 🔍 handle schema differences safely
         if "text" in example:
             text = example["text"]
         elif "content" in example:
