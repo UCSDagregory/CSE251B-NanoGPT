@@ -9,7 +9,7 @@ import hashlib
 
 # Adjust this to fit within Kaggle's session time (~9 hrs).
 # cosmopedia-v2 has ~39M docs; 1M gives ~2-4B tokens depending on doc length.
-MAX_EXAMPLES = 1_000_000
+MAX_EXAMPLES = 5_000_000
 
 # ---------------------------
 # Setup paths (your original is fine)
