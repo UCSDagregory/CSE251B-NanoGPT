@@ -4,32 +4,35 @@ import os
 import inspect
 from torch.nn import functional as F
 from typing import Any
+from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
+
 
 MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
 MODEL_STATE_DICT = "model_state_dict"
 OPTIMIZER_STATE_DICT = "optimizer_state_dict"
+ITER_NUM = "iter_num"
 CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
 class nanoGPT(nn.Module):
     def __init__(self, model_folder_name:str, chkpt_folder_name:str=None, 
-                 author:str="N/A",
+                 author:str="N/A", # Metadata args
                  vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
-        # Model : Tokens -> Transformer Block(TB) -> TB -> ... -> TB -> Vocab Projection -> Logits
-        # TB    : Input -> Multi headed attention(MHA) -> Residual_Add -> Normalization -> MLP(2 linear layers) -> Residual_Add -> Normalization -> hidden rep.
-        # AF    : Non-linear function applied to a given input that outputs the same shape, IN(R,C): AF(IN) -> OUT(R,C)
-        # MLP   : Linear layer(LL_0) -> AF -> LL_1
-        # LL_0  : (d_feedforward X d_model) matrix of weights
-        # LL_1  : (d_model X d_feedforward) matrix of weights
 
         super().__init__()
         self.block_size = block_size
         self.token_emb = nn.Embedding(vocab_size, n_embd)
         self.pos_emb = nn.Embedding(block_size, n_embd)
         self.blocks = nn.ModuleList([
+            # nn.TransformerEncoderLayer(
+            #     d_model=n_embd, nhead=n_head,
+            #     dim_feedforward=4 * n_embd, dropout=0.1,
+            #     activation="gelu", batch_first=True,
+            # )
             nn.TransformerEncoderLayer(
+                norm_first=True,
                 d_model=n_embd, nhead=n_head,
-                dim_feedforward=4 * n_embd, dropout=0.1,
+                dim_feedforward=4 * n_embd, dropout=0.0,
                 activation="gelu", batch_first=True,
             )
             for _ in range(n_layer)
@@ -56,6 +59,7 @@ class nanoGPT(nn.Module):
         self.opt_learning_rate = 0
         self.opt_betas = 0
         self.opt_device_type = 0
+        self.opt_type = "muon"
 
     def forward(self, input_ids, targets=None):
         """
@@ -114,7 +118,7 @@ class nanoGPT(nn.Module):
 
     # file_name -> no extension, the needed one is added in the func. 
     # def saveCheckpoint(self, file_name:str, epoch:int, optimizer:nn.Module, loss:int):
-    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int):
+    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, iter_num, non_eval_checkpoint=False):
         checkpoint = {
             MODEL_CONFIG: {
                 "author": self.author,
@@ -128,47 +132,169 @@ class nanoGPT(nn.Module):
                 "weight_decay":self.opt_weight_decay,
                 "learning_rate":self.opt_learning_rate,
                 "betas":self.opt_betas,
+                "optimizer":self.opt_type,
                 "device_type":self.opt_device_type,
             },
             MODEL_STATE_DICT: self.state_dict(),
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
+            ITER_NUM: iter_num,
         }
-        save_file_name = f"{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
-        # full_checkpoint_path = os.path.join(self.model_path, self.checkpoint_folder_name, save_file_name)
+        save_file_name = f"ITER{iter_num}_{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+        if (non_eval_checkpoint):
+            save_file_name = f"ITER{iter_num}_CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, optimizer_type, device_type):
         self.opt_weight_decay = weight_decay
         self.opt_learning_rate = learning_rate
         self.opt_betas = betas
+        self.opt_type = optimizer_type
         self.opt_device_type = device_type
 
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        # gather trainable params once
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
-        return optimizer
+        if optimizer_type == "muon":
+            print("Using muon optimizer")
 
+            hidden_weights = []
+            hidden_gains_biases = []
+            nonhidden_decay = []
+            nonhidden_no_decay = []
+
+            # params that should stay on Adam path, not Muon
+            nonhidden_keywords = (
+                "embed", "embedding", "wte", "wpe",
+                "head", "lm_head", "output", "classifier",
+            )
+
+            seen = set()
+
+            for name, p in param_dict.items():
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
+
+                lname = name.lower()
+
+                # embeddings / output heads stay on Adam path
+                if any(k in lname for k in nonhidden_keywords):
+                    if p.ndim >= 2:
+                        nonhidden_decay.append(p)      # embeddings / output matrices
+                    else:
+                        nonhidden_no_decay.append(p)   # biases / norm scales
+                # hidden matrix weights -> Muon
+                elif p.ndim >= 2:
+                    hidden_weights.append(p)
+                # hidden biases / norm gains -> Adam path
+                else:
+                    hidden_gains_biases.append(p)
+
+            num_hidden_weights = sum(p.numel() for p in hidden_weights)
+            num_hidden_gains_biases = sum(p.numel() for p in hidden_gains_biases)
+            num_nonhidden_params = sum(p.numel() for p in nonhidden_decay)
+
+            print(f"num muon parameter tensors: {len(hidden_weights)}, with {num_hidden_weights:,} parameters")
+            print(f"num hidden gain/bias tensors: {len(hidden_gains_biases)}, with {num_hidden_gains_biases:,} parameters")
+            print(f"num nonhidden parameter tensors: {len(nonhidden_decay)}, with {num_nonhidden_params:,} parameters")
+
+            hidden_lr,nonhidden_lr = learning_rate[0], learning_rate[1]
+            param_groups = [
+                dict(
+                    params=hidden_weights,
+                    use_muon=True,
+                    lr=hidden_lr,
+                    weight_decay=weight_decay,
+                ),
+                dict(
+                    params=hidden_gains_biases + nonhidden_no_decay,
+                    use_muon=False,
+                    lr=nonhidden_lr,
+                    betas=betas,
+                    weight_decay=0.0,
+                ),
+                dict(
+                    params=nonhidden_decay,
+                    use_muon=False,
+                    lr=nonhidden_lr,
+                    betas=betas,
+                    weight_decay=weight_decay,  # or smaller, e.g. 0.01
+                ),
+            ]
+            # param_groups = [
+            #     dict(
+            #         params=hidden_weights,
+            #         use_muon=True,
+            #         lr=hidden_lr,
+            #         weight_decay=weight_decay,
+            #     ),
+            #     dict(
+            #         params=hidden_gains_biases + nonhidden_no_decay + nonhidden_decay,
+            #         use_muon=False,
+            #         lr=nonhidden_lr,
+            #         betas=betas,
+            #         weight_decay=weight_decay,
+            #     ),
+            # ]
+
+            use_distributed_muon = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            )
+
+            if use_distributed_muon:
+                print("Using distributed MuonWithAuxAdam")
+                optimizer = MuonWithAuxAdam(param_groups)
+            else:
+                print("Using SingleDeviceMuonWithAuxAdam")
+                optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+
+            return optimizer
+
+        if optimizer_type == "adam":
+            # default AdamW path
+            decay_params = []
+            nodecay_params = []
+            seen = set()
+
+            for _, p in param_dict.items():
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
+
+                if p.dim() >= 2:
+                    decay_params.append(p)
+                else:
+                    nodecay_params.append(p)
+
+            optim_groups = [
+                {"params": decay_params, "weight_decay": weight_decay},
+                {"params": nodecay_params, "weight_decay": 0.0},
+            ]
+
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+            fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == "cuda"
+            extra_args = dict(fused=True) if use_fused else dict()
+
+            optimizer = torch.optim.AdamW(
+                optim_groups,
+                lr=learning_rate,
+                betas=betas,
+                **extra_args,
+            )
+            print(f"using fused AdamW: {use_fused}")
+
+            return optimizer
+        
+        raise ValueError(f"Invalid optimizer type: {optimizer_type}")
 def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
     model_args = [model_folder_name, chkpt_folder_name]
     model_saved_config = checkpoint[MODEL_CONFIG]
@@ -180,7 +306,7 @@ def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
         opt_args.append(opt_saved_config[key])
     return model_args, opt_args
 
-def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any]:
+def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any, int]:
     split_path = checkpoint_file_path.split('/')
     if (len(split_path) != 2):
         raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
@@ -194,8 +320,9 @@ def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple
     
     model_sd = checkpoint[MODEL_STATE_DICT]
     opt_sd = checkpoint[OPTIMIZER_STATE_DICT]
+    iter_num = checkpoint[ITER_NUM]
     checkpoint = None
-    return gpt_model, model_sd, opt_args, opt_sd
+    return gpt_model, model_sd, opt_args, opt_sd, iter_num
 
 # --- Required: load_model function ---
 def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
@@ -219,28 +346,8 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     model_args, opt_args = getArgs(checkpoint)
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
+    checkpoint = None
     print(f"#Params: {model.num_parameters}")
     model.to(device)
     model.eval()
     return model
-
-
-# --- Optional: quick sanity check ---
-
-# if __name__ == "__main__":
-#     print("Creating example model...")
-#     model = nanoGPT()
-#     n_params = sum(p.numel() for p in model.parameters())
-#     print(f"Parameters: {n_params:,}")
-
-#     # Test forward pass
-#     dummy_input = torch.randint(0, 50257, (2, 1024))
-#     logits = model(dummy_input)
-#     print(f"Input shape:  {dummy_input.shape}")
-#     print(f"Output shape: {logits.shape}")
-#     assert logits.shape == (2, 1024, 50257), "Output shape mismatch!"
-#     print("Interface check passed.")
-
-#     # Save example checkpoint
-#     torch.save(model.state_dict(), "checkpoint.pt")
-#     print("Saved example checkpoint.pt")

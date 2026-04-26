@@ -1,8 +1,8 @@
 *.pt
 */*/hf_cache
 */*/tmp
-*train.bin
-*val.bin
+*.bin
+DG_*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
