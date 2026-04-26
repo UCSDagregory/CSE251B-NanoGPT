@@ -108,7 +108,7 @@ max_checkpoints_to_keep = 5  # keep disk usage low
 # data
 dataset = args.data_fd_name
 gradient_accumulation_steps = 8  # effective batch = 32 * 4 * 1024 = 131,072 tokens/iter
-batch_size =             # micro-batch size -- safe for 99M params on 16GB T4/P100
+batch_size = 6           # micro-batch size -- safe for 99M params on 16GB T4/P100
 block_size = 1024         # Defined by project specs, DO NOT CHANGE
 
 # training length
