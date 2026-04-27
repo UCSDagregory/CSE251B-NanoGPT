@@ -110,12 +110,12 @@ batch_size = 4            # micro-batch size -- safe for 99M params on 16GB T4/P
 block_size = 1024         # Defined by project specs, DO NOT CHANGE
 
 # training length
-max_iters = 2000         # ~6.5B tokens seen. Adjust down if running out of time.
+max_iters = 10050         # ~6.5B tokens seen. Adjust down if running out of time.
 grad_clip = 1.0           # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
 decay_lr = True           # whether to decay the learning rate
-warmup_iters = 100       # longer warmup for stability at this model size
+warmup_iters = 500       # longer warmup for stability at this model size
 lr_decay_iters = max_iters  # cosine decay over full training run per Chinchilla
 min_lr = 6e-5             # minimum learning rate, ~= learning_rate/10
 
@@ -192,7 +192,7 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     checkpoint_file_path = args.chpr
     print(f"Resuming from a checkpoint:{checkpoint_file_path}")
-    model, model_sd, opt_args, opt_sd = train_helper.createModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
+    model, model_sd, opt_args, opt_sd, iter_num = train_helper.createModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
     model.load_state_dict(model_sd)
     model.to(device)
     optimizer = model.configure_optimizers(*opt_args)
@@ -296,6 +296,9 @@ model_checkpoint_path = model.getCheckpointPath()
 current_checkpoints = len(os.listdir(model_checkpoint_path))
 
 while True:
+    total_tokens_processed = iter_num * tokens_per_iter
+    print(f"Tokens processed:{total_tokens_processed} | {total_tokens_processed:.2e}")
+
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
 
@@ -338,7 +341,9 @@ while True:
                     chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
                     print(f"Removing checkpoint: {chkpt_to_remove}")
                     os.remove(chkpt_to_remove)
-                model.saveCheckpoint(optimizer, losses['val'])
+                model.saveCheckpoint(optimizer, losses['val'], iter_num)
+                with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
+                    f.write(f"{tokens_seen},{iter_num},{losses['val']:.4f}\n")
 
     if iter_num == 0 and eval_only:
         break

@@ -11,6 +11,7 @@ MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
 MODEL_STATE_DICT = "model_state_dict"
 OPTIMIZER_STATE_DICT = "optimizer_state_dict"
+ITER_NUM = "iter_num"
 CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
 
@@ -214,7 +215,7 @@ class nanoGPT(nn.Module):
     def getCheckpointPath(self):
         return os.path.join(self.model_path, self.checkpoint_folder_name)
 
-    def saveCheckpoint(self, optimizer: nn.Module, val_loss: int):
+    def saveCheckpoint(self, optimizer: nn.Module, val_loss: int, iter_num=0, non_eval_checkpoint=False):
         checkpoint = {
             MODEL_CONFIG: {
                 "author": self.author,
@@ -234,10 +235,15 @@ class nanoGPT(nn.Module):
             },
             MODEL_STATE_DICT: self.state_dict(),
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
+            ITER_NUM: iter_num,
         }
         save_file_name = (
-            f"{val_loss:08.4f}val_loss_{nanoGPT.__name__}_{self.author.replace(' ', '')}{CHECKPOINT_EXT}"
+            f"ITER{iter_num}_{val_loss:08.4f}val_loss_{nanoGPT.__name__}_{self.author.replace(' ', '')}{CHECKPOINT_EXT}"
         )
+        if non_eval_checkpoint:
+            save_file_name = (
+                f"ITER{iter_num}_CHKPT{val_loss:08.4f}val_loss_{nanoGPT.__name__}_{self.author.replace(' ', '')}{CHECKPOINT_EXT}"
+            )
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
 
@@ -381,7 +387,9 @@ def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str) -> tup
     gpt_model.checkpoint_folder_name = chkpt_folder_name
     model_sd = checkpoint[MODEL_STATE_DICT]
     opt_sd = checkpoint[OPTIMIZER_STATE_DICT]
-    return gpt_model, model_sd, opt_args, opt_sd
+    iter_num = checkpoint.get(ITER_NUM, 0)
+    checkpoint = None
+    return gpt_model, model_sd, opt_args, opt_sd, iter_num
 
 
 def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
@@ -393,6 +401,7 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     model_args, _ = getArgs(checkpoint)
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
+    checkpoint = None
     print(f"#Params: {model.num_parameters}")
     model.to(device)
     model.eval()
