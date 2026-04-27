@@ -16,8 +16,8 @@ import tiktoken
 from datasets import load_dataset
 
 # --- Config ---
-MAX_DOCS = 7_500_000       # ~2B tokens
-VAL_DOCS = 3_750            # first 1K docs go to val
+MAX_DOCS = 5_000       # ~2B tokens
+VAL_DOCS = 100            # first 1K docs go to val
 
 enc = tiktoken.get_encoding("gpt2")
 

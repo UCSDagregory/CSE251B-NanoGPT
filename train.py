@@ -110,7 +110,7 @@ batch_size = 4            # micro-batch size -- safe for 99M params on 16GB T4/P
 block_size = 1024         # Defined by project specs, DO NOT CHANGE
 
 # training length
-max_iters = 10050         # ~6.5B tokens seen. Adjust down if running out of time.
+max_iters = 5         # ~6.5B tokens seen. Adjust down if running out of time.
 grad_clip = 1.0           # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
