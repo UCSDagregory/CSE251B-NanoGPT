@@ -15,6 +15,7 @@ MODEL_STATE_DICT = "model_state_dict"
 OPTIMIZER_STATE_DICT = "optimizer_state_dict"
 CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
+ITER_NUM = "iter_num"
 
 # ---------------------------------------------------------------------------
 # Building blocks
@@ -47,7 +48,7 @@ class nanoGPT(nn.Module):
         n_head: int = 12,
         n_layer: int = 10,
         block_size: int = 1024,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.block_size = block_size
@@ -93,7 +94,12 @@ class nanoGPT(nn.Module):
         print("CUSTOM TOTAL PARAMETRS: ", self.num_parameters)
         self.author = author
         self.model_path = os.path.join(os.getcwd(), model_folder_name)
-        self.checkpoint_folder_name = chkpt_folder_name if chkpt_folder_name else CHECKPOINT_DEFAULT
+        
+        if (chkpt_folder_name is None):
+            self.checkpoint_folder_name = CHECKPOINT_DEFAULT
+        else:
+            self.checkpoint_folder_name = chkpt_folder_name
+
 
         self.opt_weight_decay = 0
         self.opt_learning_rate = 0
@@ -142,10 +148,14 @@ class nanoGPT(nn.Module):
         # Training return path, wants logits and loss with respect to a target for simplicitly
         return logits, loss
 
+    
     def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.num_parameters
-        L, H, Q, T = self.n_layer, self.n_head, self.n_embd // self.n_head, self.block_size
-        flops_per_token = 6 * N + 12 * L * H * Q * T
+        L, H, Q, T = self.n_layer, self.n_head, self.n_embd//self.n_head, self.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
@@ -161,7 +171,7 @@ class nanoGPT(nn.Module):
 
     # file_name -> no extension, the needed one is added in the func. 
     # def saveCheckpoint(self, file_name:str, epoch:int, optimizer:nn.Module, loss:int):
-    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, non_eval_checkpoint=False):
+    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, iter_num, non_eval_checkpoint=False):
         checkpoint = {
             MODEL_CONFIG: {
                 "author": self.author,
@@ -169,37 +179,30 @@ class nanoGPT(nn.Module):
                 "n_embd": self.n_embd,
                 "n_head": self.n_head,
                 "n_layer": self.n_layer,
-                "block_size": self.block_size,
-                "dropout": 0.0,
+                "block_size": self.block_size
             },
-            OPT_CONFIG: {
-                "weight_decay": self.opt_weight_decay,
-                "learning_rate": self.opt_learning_rate,
-                "betas": self.opt_betas,
-                "optimizer": self.opt_type,
-                "device_type": self.opt_device_type,
+            OPT_CONFIG:{
+                "weight_decay":self.opt_weight_decay,
+                "learning_rate":self.opt_learning_rate,
+                "betas":self.opt_betas,
+                "optimizer":self.opt_type,
+                "device_type":self.opt_device_type,
             },
             MODEL_STATE_DICT: self.state_dict(),
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
+            ITER_NUM: iter_num,
         }
-        save_file_name = (
-            f"{val_loss:08.4f}val_loss_{nanoGPT.__name__}_{self.author.replace(' ', '')}{CHECKPOINT_EXT}"
-        )
-        full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
-        save_file_name = f"{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+        save_file_name = f"ITER{iter_num}_{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
         if (non_eval_checkpoint):
-            save_file_name = f"CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+            save_file_name = f"ITER{iter_num}_CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
 
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
-
-
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, optimizer_type, device_type):
         self.opt_weight_decay = weight_decay
         self.opt_learning_rate = learning_rate
         self.opt_betas = betas
-        self.opt_type = optimizer_type
         self.opt_type = optimizer_type
         self.opt_device_type = device_type
 
@@ -211,7 +214,8 @@ class nanoGPT(nn.Module):
 
             hidden_weights = []
             hidden_gains_biases = []
-            nonhidden_params = []
+            nonhidden_decay = []
+            nonhidden_no_decay = []
 
             # params that should stay on Adam path, not Muon
             nonhidden_keywords = (
@@ -230,7 +234,10 @@ class nanoGPT(nn.Module):
 
                 # embeddings / output heads stay on Adam path
                 if any(k in lname for k in nonhidden_keywords):
-                    nonhidden_params.append(p)
+                    if p.ndim >= 2:
+                        nonhidden_decay.append(p)      # embeddings / output matrices
+                    else:
+                        nonhidden_no_decay.append(p)   # biases / norm scales
                 # hidden matrix weights -> Muon
                 elif p.ndim >= 2:
                     hidden_weights.append(p)
@@ -240,11 +247,11 @@ class nanoGPT(nn.Module):
 
             num_hidden_weights = sum(p.numel() for p in hidden_weights)
             num_hidden_gains_biases = sum(p.numel() for p in hidden_gains_biases)
-            num_nonhidden_params = sum(p.numel() for p in nonhidden_params)
+            num_nonhidden_params = sum(p.numel() for p in nonhidden_decay)
 
             print(f"num muon parameter tensors: {len(hidden_weights)}, with {num_hidden_weights:,} parameters")
             print(f"num hidden gain/bias tensors: {len(hidden_gains_biases)}, with {num_hidden_gains_biases:,} parameters")
-            print(f"num nonhidden parameter tensors: {len(nonhidden_params)}, with {num_nonhidden_params:,} parameters")
+            print(f"num nonhidden parameter tensors: {len(nonhidden_decay)}, with {num_nonhidden_params:,} parameters")
 
             hidden_lr,nonhidden_lr = learning_rate[0], learning_rate[1]
             param_groups = [
@@ -255,13 +262,35 @@ class nanoGPT(nn.Module):
                     weight_decay=weight_decay,
                 ),
                 dict(
-                    params=hidden_gains_biases + nonhidden_params,
+                    params=hidden_gains_biases + nonhidden_no_decay,
                     use_muon=False,
                     lr=nonhidden_lr,
                     betas=betas,
-                    weight_decay=weight_decay,
+                    weight_decay=0.0,
+                ),
+                dict(
+                    params=nonhidden_decay,
+                    use_muon=False,
+                    lr=nonhidden_lr,
+                    betas=betas,
+                    weight_decay=weight_decay,  # or smaller, e.g. 0.01
                 ),
             ]
+            # param_groups = [
+            #     dict(
+            #         params=hidden_weights,
+            #         use_muon=True,
+            #         lr=hidden_lr,
+            #         weight_decay=weight_decay,
+            #     ),
+            #     dict(
+            #         params=hidden_gains_biases + nonhidden_no_decay + nonhidden_decay,
+            #         use_muon=False,
+            #         lr=nonhidden_lr,
+            #         betas=betas,
+            #         weight_decay=weight_decay,
+            #     ),
+            # ]
 
             use_distributed_muon = (
                 torch.distributed.is_available()
@@ -321,38 +350,56 @@ class nanoGPT(nn.Module):
         raise ValueError(f"Invalid optimizer type: {optimizer_type}")
 def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
     model_args = [model_folder_name, chkpt_folder_name]
-    for key in checkpoint[MODEL_CONFIG]:
-        model_args.append(checkpoint[MODEL_CONFIG][key])
+    model_saved_config = checkpoint[MODEL_CONFIG]
+    for key in model_saved_config:
+        model_args.append(model_saved_config[key])
     opt_args = []
-    for key in checkpoint[OPT_CONFIG]:
-        opt_args.append(checkpoint[OPT_CONFIG][key])
+    opt_saved_config = checkpoint[OPT_CONFIG]
+    for key in opt_saved_config:
+        opt_args.append(opt_saved_config[key])
     return model_args, opt_args
 
-
-def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str) -> tuple:
-    split_path = checkpoint_file_path.split("/")
-    if len(split_path) != 2:
-        raise ValueError("Checkpoint path should be folder_name/checkpoint_to_load.ext")
-    chkpt_folder_name, ckpt_file_name = split_path
+def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any, int]:
+    split_path = checkpoint_file_path.split('/')
+    if (len(split_path) != 2):
+        raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
+    chkpt_folder_name, ckpt_file_name  = split_path
     load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
     checkpoint = torch.load(load_path, weights_only=True)
     model_args, opt_args = getArgs(checkpoint, model_folder_name, chkpt_folder_name)
+
     gpt_model = nanoGPT(*model_args)
     gpt_model.checkpoint_folder_name = chkpt_folder_name
+    
     model_sd = checkpoint[MODEL_STATE_DICT]
     opt_sd = checkpoint[OPTIMIZER_STATE_DICT]
-    return gpt_model, model_sd, opt_args, opt_sd
+    iter_num = checkpoint[ITER_NUM]
+    checkpoint = None
+    return gpt_model, model_sd, opt_args, opt_sd, iter_num
 
-
+# --- Required: load_model function ---
 def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     """
-    Load trained model from checkpoint. Called by evaluate.py.
-    Returns model where: model(input_ids) -> logits
+    Load your trained model from a checkpoint.
+
+    This function is called by evaluate.py. It must return a model where:
+        model(input_ids) -> logits
+        - input_ids: LongTensor of shape (batch, seq_len)
+        - logits: FloatTensor of shape (batch, seq_len, 50257)
+
+    Args:
+        checkpoint_path: Path to your checkpoint.pt file
+        device: Device to load onto ("cuda" or "cpu")
+
+    Returns:
+        model: nn.Module in eval mode
     """
+    # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model_args, _ = getArgs(checkpoint)
+    model_args, opt_args = getArgs(checkpoint)
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
+    checkpoint = None
     print(f"#Params: {model.num_parameters}")
     model.to(device)
     model.eval()

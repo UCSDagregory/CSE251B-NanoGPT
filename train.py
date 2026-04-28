@@ -20,7 +20,6 @@ import os
 import time
 import math
 import pickle
-import csv
 from contextlib import nullcontext
 
 import numpy as np
@@ -31,8 +30,6 @@ from torch.distributed import init_process_group, destroy_process_group
 import train_helper_generic as train_helper
 import train_helper_loader as th_loader
 import argparse
-
-import json
 
 import json
 
@@ -97,7 +94,7 @@ if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
 # eval_interval = 2000
-eval_interval = 75 # How many iters until re-calculate val. loss
+eval_interval = 100 # How many iters until re-calculate val. loss
 # eval_interval = 5
 log_interval = 1
 eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
@@ -107,7 +104,7 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 # iters_per_checkpoint = 5
 iters_per_checkpoint = 15
 # max_checkpoints_to_keep = 25
-max_checkpoints_to_keep = 60
+max_checkpoints_to_keep = 30
 
 dataset = args.data_fd_name
 effective_batch_size = 96
@@ -126,7 +123,7 @@ effective_batch_size = 96
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 6 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -150,12 +147,17 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
+# device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 device = args.device
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 # compile = True # use PyTorch 2.0 to compile the model to be faster
 
 print(f"Maximum unique training tokens{max_iters*effective_batch_size*block_size:.2e}\n\n")
 
+# -----------------------------------------------------------------------------
+# config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+# exec(open('configurator.py').read()) # overrides from command line or config file
+# config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
@@ -197,6 +199,7 @@ iter_num = 0
 best_val_loss = 1e9
 
 if init_from == 'scratch':
+    # init a new model from scratch
     print("Initializing a new model from scratch")
     model = train_helper.createModel(model_folder_name, None, chkpt_folder_name_init)
     opt_args = parsed_opt_args
@@ -313,11 +316,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num%eval_interval == 0 and master_process:
         losses = estimate_loss()
-        train_ppl = math.exp(losses['train'])
-        val_ppl = math.exp(losses['val'])
-        tokens_seen = iter_num * tokens_per_iter
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, "
-              f"train ppl {train_ppl:.1f}, val ppl {val_ppl:.1f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
     if iter_num%iters_per_checkpoint == 0 or (iter_num%eval_interval == 0 and losses['val'] < best_val_loss):
         best_val_loss = losses['val']
@@ -342,9 +341,15 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
+        print(f"Microstep:{micro_step}\n")
         if ddp:
+            # in DDP training we only need to sync gradients at the last micro step.
+            # the official way to do this is with model.no_sync() context manager, but
+            # I really dislike that this bloats the code and forces us to repeat code
+            # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
@@ -352,15 +357,15 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = batch_helper.get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-            loss = loss / gradient_accumulation_steps
-        X, Y = get_batch('train')
         scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
@@ -368,159 +373,19 @@ while True:
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
+        # get loss as float. note: this is a CPU-GPU sync point
+        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5:
+        if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        tokens_seen = iter_num * tokens_per_iter
-
-        # Format LR for logging (scalar for adam, first element for muon)
-        lr_for_log = lr if OPT_TYPE == "adam" else lr[0]
-
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-
-        # Log train metrics
-        train_log_writer.writerow([
-            iter_num,
-            f"{lossf:.4f}",
-            f"{lr_for_log:.6e}",
-            f"{running_mfu:.4f}",
-            f"{dt*1000:.2f}",
-            tokens_seen,
-        ])
-        train_log_file.flush()
-
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
     if iter_num > max_iters:
         break
-
-# ---------------------------------------------------------------------------
-# Close log files
-# ---------------------------------------------------------------------------
-train_log_file.close()
-eval_log_file.close()
-
-# ---------------------------------------------------------------------------
-# Print summary table
-# ---------------------------------------------------------------------------
-training_end_time = time.time()
-total_time = training_end_time - training_start_time
-total_tokens = iter_num * tokens_per_iter
-
-# Format final LR for display
-lr_display = f"{lr:.6e}" if OPT_TYPE == "adam" else f"[{lr[0]:.6e}, {lr[1]:.6e}]"
-
-print("\n" + "="*60)
-print("TRAINING SUMMARY")
-print("="*60)
-print(f"  Model parameters:      {n_params:,}")
-print(f"  Total iterations:      {iter_num:,}")
-print(f"  Total tokens seen:     {total_tokens:,}")
-print(f"  Training time:         {total_time/3600:.2f} hours")
-print(f"  Tokens/sec:            {total_tokens/total_time:,.0f}")
-print(f"  Best val loss:         {best_val_loss:.4f}")
-print(f"  Best val PPL:          {math.exp(best_val_loss):.2f}")
-print(f"  Final learning rate:   {lr_display}")
-print(f"  Optimizer:             {OPT_TYPE}")
-print(f"  Batch size (micro):    {batch_size}")
-print(f"  Grad accum steps:      {gradient_accumulation_steps}")
-print(f"  Tokens per iter:       {tokens_per_iter:,}")
-print(f"  Device:                {device}")
-print(f"  Dtype:                 {dtype}")
-print("="*60)
-
-# ---------------------------------------------------------------------------
-# Generate plots
-# ---------------------------------------------------------------------------
-try:
-    import matplotlib
-    matplotlib.use('Agg')  # non-interactive backend for headless servers
-    import matplotlib.pyplot as plt
-
-    # --- Read eval CSV ---
-    eval_iters_list, eval_train_loss, eval_val_loss = [], [], []
-    eval_train_ppl, eval_val_ppl = [], []
-    with open(eval_log_path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            eval_iters_list.append(int(row["iter"]))
-            eval_train_loss.append(float(row["train_loss"]))
-            eval_val_loss.append(float(row["val_loss"]))
-            eval_train_ppl.append(float(row["train_ppl"]))
-            eval_val_ppl.append(float(row["val_ppl"]))
-
-    # --- Read train CSV ---
-    train_iters_list, train_loss_list, lr_list, mfu_list = [], [], [], []
-    with open(train_log_path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            train_iters_list.append(int(row["iter"]))
-            train_loss_list.append(float(row["train_loss"]))
-            lr_list.append(float(row["lr"]))
-            mfu_list.append(float(row["mfu"]))
-
-    # --- Figure 1: Train & Val Loss ---
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(train_iters_list, train_loss_list, alpha=0.3, label="Train loss (per iter)", color="blue")
-    ax.plot(eval_iters_list, eval_train_loss, 'o-', label="Train loss (eval)", color="blue", markersize=3)
-    ax.plot(eval_iters_list, eval_val_loss, 'o-', label="Val loss (eval)", color="red", markersize=3)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Loss (cross-entropy)")
-    ax.set_title("Training & Validation Loss")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(log_dir, "loss_curve.png"), dpi=150)
-    print(f"Saved: {os.path.join(log_dir, 'loss_curve.png')}")
-
-    # --- Figure 2: Val PPL ---
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(eval_iters_list, eval_val_ppl, 'o-', label="Val PPL", color="red", markersize=3)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Perplexity")
-    ax.set_title("Validation Perplexity")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(log_dir, "val_ppl_curve.png"), dpi=150)
-    print(f"Saved: {os.path.join(log_dir, 'val_ppl_curve.png')}")
-
-    # --- Figure 3: Learning Rate Schedule ---
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(train_iters_list, lr_list, color="green")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Learning Rate")
-    ax.set_title("Learning Rate Schedule (Warmup + Cosine Decay)")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(log_dir, "lr_schedule.png"), dpi=150)
-    print(f"Saved: {os.path.join(log_dir, 'lr_schedule.png')}")
-
-    # --- Figure 4: MFU ---
-    fig, ax = plt.subplots(figsize=(10, 4))
-    valid = [(i, m) for i, m in zip(train_iters_list, mfu_list) if m > 0]
-    if valid:
-        ax.plot([x[0] for x in valid], [x[1]*100 for x in valid], color="purple")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("MFU (%)")
-    ax.set_title("Model FLOPs Utilization")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(log_dir, "mfu_curve.png"), dpi=150)
-    print(f"Saved: {os.path.join(log_dir, 'mfu_curve.png')}")
-
-    plt.close('all')
-    print("\nAll plots saved successfully.")
-
-except ImportError:
-    print("\nmatplotlib not installed -- skipping plot generation.")
-    print("Install with: pip install matplotlib")
-except Exception as e:
-    print(f"\nPlot generation failed: {e}")
-    print("CSV logs are still available for manual plotting.")
 
 if ddp:
     destroy_process_group()

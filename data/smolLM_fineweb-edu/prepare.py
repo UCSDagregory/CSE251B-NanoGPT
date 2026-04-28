@@ -8,6 +8,7 @@ from tqdm import tqdm
 import hashlib
 
 MAX_EXAMPLES = 5_000_000
+BUFFER_SIZE = 100_000
 # ---------------------------
 # Setup directories (unchanged)
 # ---------------------------
@@ -49,7 +50,7 @@ if __name__ == "__main__":
         "fineweb-edu-dedup",
         split="train",        
         streaming=True        
-    )
+    ).shuffle(buffer_size=BUFFER_SIZE)
 
     train_path = SCRIPT_DIR / "train.bin"
     val_path = SCRIPT_DIR / "val.bin"

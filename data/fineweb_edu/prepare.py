@@ -30,7 +30,7 @@ if __name__ == '__main__':
         name="sample-10BT",
         split="train",
         streaming=True,
-    )
+    ).shuffle(buffer_size=200000)
 
     train_file = open(SCRIPT_DIR / "train.bin", "wb")
     val_file = open(SCRIPT_DIR / "val.bin", "wb")
