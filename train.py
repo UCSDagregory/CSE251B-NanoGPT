@@ -107,7 +107,7 @@ iters_per_checkpoint = 15
 max_checkpoints_to_keep = 30
 
 dataset = args.data_fd_name
-effective_batch_size = 96
+effective_batch_size = 32
 # Important note
 # batch_size exists to be memory efficient, if there isn't enough space in the GPU memory it will spill over into SMEM (shared memory)
 # which is significantly slower than it just living in VRAM
