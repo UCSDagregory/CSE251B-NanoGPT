@@ -102,7 +102,7 @@ eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 # iters_per_checkpoint = 5
-iters_per_checkpoint = 15
+iters_per_checkpoint = 500
 # max_checkpoints_to_keep = 25
 max_checkpoints_to_keep = 30
 
@@ -344,7 +344,7 @@ while True:
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        print(f"Microstep:{micro_step}\n")
+        #print(f"Microstep:{micro_step}\n")
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
