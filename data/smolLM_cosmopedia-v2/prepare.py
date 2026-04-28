@@ -80,7 +80,7 @@ if __name__ == "__main__":
             continue  # skip weird rows
 
         # tokenize (GPT-2)
-        ids = enc.encode(text, allowed_special={"<|endoftext|>"})
+        ids = enc.encode(text, allowed_special="all")
         ids.append(enc.eot_token)
 
         arr = np.array(ids, dtype=np.uint16)
