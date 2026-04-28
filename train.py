@@ -132,7 +132,7 @@ print(f"Gradient accumulation steps:{gradient_accumulation_steps} | Total effect
 block_size = 1024 # Defined by project specs, DO NOT CHANGE
 
 # max_iters = 600000 # total number of training iterations
-max_iters = 3000 # total number of training iterations
+max_iters = 10000 # total number of training iterations
 # max_iters = 1500 # total number of training iterations
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 

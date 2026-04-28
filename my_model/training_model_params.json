@@ -1,10 +1,10 @@
 {
     "author":"Felicia Tao",
     "vocab_size":50257,
-    "n_embed":128,
-    "num_heads":4,
-    "num_layers":4,
+    "n_embed":386,
+    "num_heads":6,
+    "num_layers":6,
     "block_size":1024,
-    "num_experts":8,
-    "top_k":4
+    "num_experts":1,
+    "top_k":1
 }
