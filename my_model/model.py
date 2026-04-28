@@ -60,7 +60,7 @@ class nanoGPT(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, n_embd)
 
         #Hybrid SSM + Transformer
-        attn_every = 5
+        attn_every = 6
         blocks = []
         for i in range(n_layer):
             if (i + 1) % attn_every == 0:
