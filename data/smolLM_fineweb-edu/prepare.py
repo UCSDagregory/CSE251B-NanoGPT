@@ -73,7 +73,7 @@ if __name__ == "__main__":
             continue  # skip unknown rows
 
         # GPT-2 tokenization
-        ids = enc.encode(text)
+        ids = enc.encode(text, allowed_special={"<|endoftext|>"})
         ids.append(enc.eot_token)
 
         arr = np.array(ids, dtype=np.uint16)
