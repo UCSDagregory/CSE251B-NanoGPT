@@ -233,7 +233,11 @@ else:
     raise ValueError("Unknown input for --type")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
+# scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
+if hasattr(torch.amp, "GradScaler"):
+    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
+else:
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
 # wrap model into DDP container
 if ddp:
