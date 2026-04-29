@@ -11,6 +11,7 @@ MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
 MODEL_STATE_DICT = "model_state_dict"
 OPTIMIZER_STATE_DICT = "optimizer_state_dict"
+ITER_NUM = "iter_num"
 CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
 
@@ -108,12 +109,6 @@ class nanoGPT(nn.Module):
                  author:str="N/A", 
                  vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024,
                  num_experts=8, top_k=2): # Added MoE params
-        # Model : Tokens -> Transformer Block(TB) -> TB -> ... -> TB -> Vocab Projection -> Logits
-        # TB    : Input -> Multi headed attention(MHA) -> Residual_Add -> Normalization -> MLP(2 linear layers) -> Residual_Add -> Normalization -> hidden rep.
-        # AF    : Non-linear function applied to a given input that outputs the same shape, IN(R,C): AF(IN) -> OUT(R,C)
-        # MLP   : Linear layer(LL_0) -> AF -> LL_1
-        # LL_0  : (d_feedforward X d_model) matrix of weights
-        # LL_1  : (d_model X d_feedforward) matrix of weights
         
         super().__init__()
         self.block_size = block_size
@@ -151,7 +146,7 @@ class nanoGPT(nn.Module):
         self.opt_learning_rate = 0
         self.opt_betas = 0
         self.opt_device_type = 0
-        self.opt_type = "adam"
+        self.opt_type = "muon"
 
     def forward(self, input_ids, targets=None):
         """
@@ -203,7 +198,7 @@ class nanoGPT(nn.Module):
 
     # file_name -> no extension, the needed one is added in the func. 
     # def saveCheckpoint(self, file_name:str, epoch:int, optimizer:nn.Module, loss:int):
-    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, non_eval_checkpoint=False):
+    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, iter_num, non_eval_checkpoint=False):
         checkpoint = {
             MODEL_CONFIG: {
                 "author": self.author,
@@ -224,10 +219,11 @@ class nanoGPT(nn.Module):
             },
             MODEL_STATE_DICT: self.state_dict(),
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
+            ITER_NUM: iter_num,
         }
-        save_file_name = f"{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+        save_file_name = f"ITER{iter_num}_{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
         if (non_eval_checkpoint):
-            save_file_name = f"CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+            save_file_name = f"ITER{iter_num}_CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
 
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
@@ -247,7 +243,8 @@ class nanoGPT(nn.Module):
 
             hidden_weights = []
             hidden_gains_biases = []
-            nonhidden_params = []
+            nonhidden_decay = []
+            nonhidden_no_decay = []
 
             # params that should stay on Adam path, not Muon
             nonhidden_keywords = (
@@ -266,7 +263,10 @@ class nanoGPT(nn.Module):
 
                 # embeddings / output heads stay on Adam path
                 if any(k in lname for k in nonhidden_keywords):
-                    nonhidden_params.append(p)
+                    if p.ndim >= 2:
+                        nonhidden_decay.append(p)      # embeddings / output matrices
+                    else:
+                        nonhidden_no_decay.append(p)   # biases / norm scales
                 # hidden matrix weights -> Muon
                 elif p.ndim >= 2:
                     hidden_weights.append(p)
@@ -276,11 +276,11 @@ class nanoGPT(nn.Module):
 
             num_hidden_weights = sum(p.numel() for p in hidden_weights)
             num_hidden_gains_biases = sum(p.numel() for p in hidden_gains_biases)
-            num_nonhidden_params = sum(p.numel() for p in nonhidden_params)
+            num_nonhidden_params = sum(p.numel() for p in nonhidden_decay)
 
             print(f"num muon parameter tensors: {len(hidden_weights)}, with {num_hidden_weights:,} parameters")
             print(f"num hidden gain/bias tensors: {len(hidden_gains_biases)}, with {num_hidden_gains_biases:,} parameters")
-            print(f"num nonhidden parameter tensors: {len(nonhidden_params)}, with {num_nonhidden_params:,} parameters")
+            print(f"num nonhidden parameter tensors: {len(nonhidden_decay)}, with {num_nonhidden_params:,} parameters")
 
             hidden_lr,nonhidden_lr = learning_rate[0], learning_rate[1]
             param_groups = [
@@ -291,13 +291,35 @@ class nanoGPT(nn.Module):
                     weight_decay=weight_decay,
                 ),
                 dict(
-                    params=hidden_gains_biases + nonhidden_params,
+                    params=hidden_gains_biases + nonhidden_no_decay,
                     use_muon=False,
                     lr=nonhidden_lr,
                     betas=betas,
-                    weight_decay=weight_decay,
+                    weight_decay=0.0,
+                ),
+                dict(
+                    params=nonhidden_decay,
+                    use_muon=False,
+                    lr=nonhidden_lr,
+                    betas=betas,
+                    weight_decay=weight_decay,  # or smaller, e.g. 0.01
                 ),
             ]
+            # param_groups = [
+            #     dict(
+            #         params=hidden_weights,
+            #         use_muon=True,
+            #         lr=hidden_lr,
+            #         weight_decay=weight_decay,
+            #     ),
+            #     dict(
+            #         params=hidden_gains_biases + nonhidden_no_decay + nonhidden_decay,
+            #         use_muon=False,
+            #         lr=nonhidden_lr,
+            #         betas=betas,
+            #         weight_decay=weight_decay,
+            #     ),
+            # ]
 
             use_distributed_muon = (
                 torch.distributed.is_available()
@@ -366,7 +388,7 @@ def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
         opt_args.append(opt_saved_config[key])
     return model_args, opt_args
 
-def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any]:
+def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any, int]:
     split_path = checkpoint_file_path.split('/')
     if (len(split_path) != 2):
         raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
@@ -380,8 +402,9 @@ def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple
     
     model_sd = checkpoint[MODEL_STATE_DICT]
     opt_sd = checkpoint[OPTIMIZER_STATE_DICT]
+    iter_num = checkpoint[ITER_NUM]
     checkpoint = None
-    return gpt_model, model_sd, opt_args, opt_sd
+    return gpt_model, model_sd, opt_args, opt_sd, iter_num
 
 # --- Required: load_model function ---
 def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
@@ -405,6 +428,7 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     model_args, opt_args = getArgs(checkpoint)
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
+    checkpoint = None
     print(f"#Params: {model.num_parameters}")
     model.to(device)
     model.eval()
