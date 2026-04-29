@@ -107,7 +107,7 @@ iters_per_checkpoint = 500
 max_checkpoints_to_keep = 30
 
 dataset = args.data_fd_name
-effective_batch_size = 32
+effective_batch_size = 64
 # Important note
 # batch_size exists to be memory efficient, if there isn't enough space in the GPU memory it will spill over into SMEM (shared memory)
 # which is significantly slower than it just living in VRAM
@@ -123,7 +123,7 @@ effective_batch_size = 32
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
