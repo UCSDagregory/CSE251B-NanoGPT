@@ -33,5 +33,5 @@ def createModel(model_folder_name:str, checkpoint_file_path:str=None, chkpt_fold
                 raise ValueError("Checkpoint name cannot be none if not creating from scratch.\n")
         except:
                 raise ValueError("Checkpoint name cannot be none if not creating from scratch.\n")
-        gpt_model, model_sd, opt_args, opt_sd = model.loadFromCheckpoint(model_folder_name, checkpoint_file_path)
-        return gpt_model, model_sd, opt_args, opt_sd
+        gpt_model, model_sd, opt_args, opt_sd, iter_num = model.loadFromCheckpoint(model_folder_name, checkpoint_file_path)
+        return gpt_model, model_sd, opt_args, opt_sd, iter_num
