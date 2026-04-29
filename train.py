@@ -65,6 +65,8 @@ parser.add_argument("--chpn", required=False) # folder_name to save checkpoints,
 parser.add_argument("--chpr", required=False) # folder_name/checkpoint_file_name
 parser.add_argument("--opt_name", required=False)
 parser.add_argument("--data_collection", required=False)
+parser.add_argument("--stream", required=False, default='F') # if T then will use streaming rather than looking for files on disk
+parser.add_argument("--stream_config", required=False, default=None)
 
 args = parser.parse_args()
 
@@ -93,17 +95,22 @@ parsed_opt_args = parseOptParams(opt_path)
 if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
-# eval_interval = 2000
+is_streaming = False
+if (args.stream == 'T'):
+    is_streaming = True
+
+streaming_config = args.stream_config
+if (not args.stream_config is None):
+    if (not is_streaming):
+        raise ValueError("Not allowed to define a stream config when not streaming.")
+    streaming_config = args.stream_config
+
 eval_interval = 75 # How many iters until re-calculate val. loss
-# eval_interval = 5
 log_interval = 1
 eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
-# eval_iters = 5
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-# iters_per_checkpoint = 5
 iters_per_checkpoint = 15
-# max_checkpoints_to_keep = 25
 max_checkpoints_to_keep = 60
 
 dataset = args.data_fd_name
@@ -122,9 +129,9 @@ effective_batch_size = 96
 # It's been changed s.t. the user now fixes effective_batch_size to a number they deem reasonable for clean gradients and batch_size to ensure training is as performant as possible
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
-# batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -192,8 +199,12 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-data_dir = os.path.join(os.getcwd(), dataset)
-batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type)
+if (is_streaming):
+    data_dir = dataset
+else:
+    data_dir = os.path.join(os.getcwd(), dataset)
+# batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type)
+batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type, streaming=is_streaming, streaming_config_name=streaming_config)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
