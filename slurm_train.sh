@@ -91,7 +91,7 @@ if timeout 3m python train.py \
   --folder my_model \
   --data_fd_name "https://huggingface.co/datasets/HuggingFaceFW/fineweb" \
   --stream T \
-  --stream_config 10BT
+  --stream_config sample-10BT
 then
     echo "Training finished before timeout."
 else
