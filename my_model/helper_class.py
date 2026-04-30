@@ -162,4 +162,4 @@ class MambaBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        return x + self.drop(self.mamba(self.silu(self.norm(x))))
+        return x + self.drop(self.mamba(self.norm(x)))

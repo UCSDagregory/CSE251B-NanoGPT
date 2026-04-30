@@ -96,8 +96,8 @@ if (LEARNING_RATE is None):
 # eval_interval = 2000
 eval_interval = 100 # How many iters until re-calculate val. loss
 # eval_interval = 5
-log_interval = 1
-eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
+log_interval = 100
+eval_iters = 100# How many times to calculate val.loss per 'eval interval'
 # eval_iters = 5
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -310,6 +310,7 @@ while True:
         hidden_lr, nonhidden_lr = lr
         optimizer.param_groups[0]["lr"] = hidden_lr
         optimizer.param_groups[1]["lr"] = nonhidden_lr
+        optimizer.param_groups[2]["lr"] = nonhidden_lr
     else:
         raise ValueError("Something is incorrect with learning rate or optimizer type. Adam is a single scalar: ..., Muon is a list: [...]")
 

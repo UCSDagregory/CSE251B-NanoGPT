@@ -48,7 +48,7 @@ class nanoGPT(nn.Module):
         n_head: int = 12,
         n_layer: int = 10,
         block_size: int = 1024,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.block_size = block_size
@@ -130,8 +130,8 @@ class nanoGPT(nn.Module):
         for block in self.blocks:
            x = block(x)
            
-        x = self.ln_f(x)
         x = self.drop(x)
+        x = self.ln_f(x)
         logits = self.lm_head(x)
 
         if targets is not None:
