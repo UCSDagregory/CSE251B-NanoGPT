@@ -381,7 +381,7 @@ def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str) -> tup
         raise ValueError("Checkpoint path should be folder_name/checkpoint_to_load.ext")
     chkpt_folder_name, ckpt_file_name = split_path
     load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
-    checkpoint = torch.load(load_path, weights_only=True)
+    checkpoint = torch.load(load_path, weights_only=False)
     model_args, opt_args = getArgs(checkpoint, model_folder_name, chkpt_folder_name)
     gpt_model = nanoGPT(*model_args)
     gpt_model.checkpoint_folder_name = chkpt_folder_name
@@ -397,7 +397,7 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     Load trained model from checkpoint. Called by evaluate.py.
     Returns model where: model(input_ids) -> logits
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_args, _ = getArgs(checkpoint)
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
