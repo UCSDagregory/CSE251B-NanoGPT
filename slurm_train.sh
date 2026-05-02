@@ -84,10 +84,10 @@ echo "Starting training smoke test..."
 
 if timeout 5h python train.py \
   --device cuda \
-  --type resume \
-  --folder my_model \
+  --type scratch \
+  --folder start_dist \
   --data_fd_name data/mixed-data \
-  --chpr checkpoints/ITER00014050_003.3023val_loss_nanoGPT_DaginGregory.pt
+  --chpn 45151525 
 then
     echo "Training finished before timeout."
 else

@@ -131,8 +131,8 @@ effective_batch_size = 96
 # It's been changed s.t. the user now fixes effective_batch_size to a number they deem reasonable for clean gradients and batch_size to ensure training is as performant as possible
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
-# batch_size = 10 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 10 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
@@ -365,12 +365,14 @@ while True:
             # model.saveCheckpoint(optimizer, losses['val'], iter_num)
             if (iter_num%eval_interval == 0):
                 model.saveCheckpoint(optimizer, losses['val'], iter_num)
+                with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
+                    f.write(f"{total_tokens_processed},{iter_num},{losses['val']:.4f}\n")
             else:
                 model.saveCheckpoint(optimizer, lossf, iter_num)
             # if (not args.data_collection is None):
             # Just save to training data as a default
-            with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
-                f.write(f"{total_tokens_processed},{iter_num},{lossf:.4f}\n")
+            #with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
+            #    f.write(f"{total_tokens_processed},{iter_num},{lossf:.4f}\n")
     if iter_num == 0 and eval_only:
         break
 
