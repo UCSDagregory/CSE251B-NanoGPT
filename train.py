@@ -104,10 +104,10 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 # iters_per_checkpoint = 5
 iters_per_checkpoint = 500
 # max_checkpoints_to_keep = 25
-max_checkpoints_to_keep = 30
+max_checkpoints_to_keep = 8
 
 dataset = args.data_fd_name
-effective_batch_size = 64
+effective_batch_size = 96
 # Important note
 # batch_size exists to be memory efficient, if there isn't enough space in the GPU memory it will spill over into SMEM (shared memory)
 # which is significantly slower than it just living in VRAM
@@ -123,7 +123,7 @@ effective_batch_size = 64
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -132,7 +132,7 @@ print(f"Gradient accumulation steps:{gradient_accumulation_steps} | Total effect
 block_size = 1024 # Defined by project specs, DO NOT CHANGE
 
 # max_iters = 600000 # total number of training iterations
-max_iters = 10000 # total number of training iterations
+max_iters = 5000 # total number of training iterations
 # max_iters = 1500 # total number of training iterations
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 

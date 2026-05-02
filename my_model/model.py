@@ -29,8 +29,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * norm).type_as(x) * self.weight
+        x_f = x.float()                                                                                                                                                                                                                                                                                                   
+        norm = x_f.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x_f * norm).type_as(x) * self.weight
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +131,7 @@ class nanoGPT(nn.Module):
         for block in self.blocks:
            x = block(x)
            
-        x = self.drop(x)
+        #x = self.drop(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
 

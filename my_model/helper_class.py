@@ -24,10 +24,10 @@ class RotaryPositionalEmbeddings(nn.Module):
 
   def _build_cache(self, x: torch.Tensor):
 
-    if self.cos_cached is not None and x.shape[0] <= self.cos_cached.shape[0]:
+    if self.cos_cached is not None and x.shape[2] <= self.cos_cached.shape[2]:
       return
 
-    seq_len = x.shape[0]
+    seq_len = x.shape[2]
 
     theta = 1. / (self.base ** (torch.arange(0, self.d, 2).float() / self.d)).to(x.device) # THETA = 10,000^(-2*i/d) or 1/10,000^(2i/d)
 
@@ -37,9 +37,9 @@ class RotaryPositionalEmbeddings(nn.Module):
 
     idx_theta2 = torch.cat([idx_theta, idx_theta], dim=1) # [THETA_1, THETA_2...THETA_d/2] -> [THETA_1, THETA_2...THETA_d]
 
-
-    self.cos_cached = idx_theta2.cos()[:, None, None, :] #Cache [cosTHETA_1, cosTHETA_2...cosTHETA_d]
-    self.sin_cached = idx_theta2.sin()[:, None, None, :] #cache [sinTHETA_1, sinTHETA_2...sinTHETA_d]
+    # shape (1, 1, T, head_dim) to broadcast over (B, n_head, T, head_dim)
+    self.cos_cached = idx_theta2.cos()[None, None, :, :]
+    self.sin_cached = idx_theta2.sin()[None, None, :, :]
 
   def _neg_half(self, x: torch.Tensor):
 
@@ -54,7 +54,7 @@ class RotaryPositionalEmbeddings(nn.Module):
 
     neg_half_x = self._neg_half(x)
 
-    x_rope = (x * self.cos_cached[:x.shape[0]]) + (neg_half_x * self.sin_cached[:x.shape[0]]) # [x_1*cosTHETA_1 - x_d/2*sinTHETA_d/2, ....]
+    x_rope = (x * self.cos_cached[:, :, :x.shape[2]]) + (neg_half_x * self.sin_cached[:, :, :x.shape[2]])
 
     return x_rope
   
@@ -111,22 +111,17 @@ class CausalSelfAttentionBlock(nn.Module):
         x = self.norm1(x)
  
         # Project to Q, K, V and split into heads
-        # (B, T, C) -> (B, T, n_head, head_dim) -> (T, B, n_head, head_dim) for RoPE
+        # (B, T, C) -> (B, T, n_head, head_dim) -> (B, n_head, T, head_dim)
         def split_heads(t):
-            return t.view(B, T, self.n_head, self.head_dim).permute(1, 0, 2, 3)
- 
-        q = split_heads(self.q_proj(x))  # (T, B, n_head, head_dim)
+            return t.view(B, T, self.n_head, self.head_dim).permute(0, 2, 1, 3)
+
+        q = split_heads(self.q_proj(x))  # (B, n_head, T, head_dim)
         k = split_heads(self.k_proj(x))
         v = split_heads(self.v_proj(x))
- 
-        # Apply RoPE to Q and K only
+
+        # Apply RoPE to Q and K only — RoPE now expects (B, n_head, T, head_dim)
         q = self.rope(q)
         k = self.rope(k)
- 
-        # Reshape for scaled dot-product attention: (B, n_head, T, head_dim)
-        q = q.permute(1, 2, 0, 3)
-        k = k.permute(1, 2, 0, 3)
-        v = v.permute(1, 2, 0, 3)
  
         # Causal scaled dot-product attention (uses Flash Attention when available)
         attn_out = torch.nn.functional.scaled_dot_product_attention(
