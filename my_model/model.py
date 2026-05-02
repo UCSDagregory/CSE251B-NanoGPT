@@ -250,6 +250,7 @@ class nanoGPT(nn.Module):
             nonhidden_keywords = (
                 "embed", "embedding", "wte", "wpe",
                 "head", "lm_head", "output", "classifier",
+                "router",
             )
 
             seen = set()
