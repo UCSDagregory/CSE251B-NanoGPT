@@ -32,6 +32,8 @@ import train_helper_loader as th_loader
 import argparse
 
 import json
+import re
+
 
 TRAIN_HELPER_FILENAME = "train_helper.py"
 OPT_FILENAME = "training_opt_params.json"
@@ -105,13 +107,13 @@ if (not args.stream_config is None):
         raise ValueError("Not allowed to define a stream config when not streaming.")
     streaming_config = args.stream_config
 
-eval_interval = 75 # How many iters until re-calculate val. loss
+eval_interval = 150 # How many iters until re-calculate val. loss
 log_interval = 1
 eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-iters_per_checkpoint = 15
-max_checkpoints_to_keep = 60
+iters_per_checkpoint = 10
+max_checkpoints_to_keep = 5 
 
 dataset = args.data_fd_name
 effective_batch_size = 96
@@ -129,8 +131,8 @@ effective_batch_size = 96
 # It's been changed s.t. the user now fixes effective_batch_size to a number they deem reasonable for clean gradients and batch_size to ensure training is as performant as possible
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
-batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-# batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# batch_size = 10 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
@@ -334,17 +336,32 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
+
     if iter_num%iters_per_checkpoint == 0 or (iter_num%eval_interval == 0 and losses['val'] < best_val_loss):
         best_val_loss = losses['val']
         if iter_num >= 0:
             print(f"Current val loss:{losses['val']:.4f}")
             current_checkpoints = len(os.listdir(model_checkpoint_path))
             if (current_checkpoints >= max_checkpoints_to_keep):
-                files = os.listdir(model_checkpoint_path) # pseudo sorted because the val. loss is expected to decrease with time
-                # chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
-                chkpt_to_remove = os.path.join(model_checkpoint_path, files[0]) # we remove the first since we store the iter num in the file name now since it's a better indicator of performance
+                def _checkpoint_iter_num(filename):
+                    match = re.search(r"ITER0*(\d+)", filename)
+                    if match is None:
+                        raise ValueError(f"Could not parse iteration number from checkpoint filename: {filename}")
+                    return int(match.group(1))
+
+                files = [
+                    f for f in os.listdir(model_checkpoint_path)
+                    if os.path.isfile(os.path.join(model_checkpoint_path, f))
+                ]
+
+                chkpt_to_remove = os.path.join(
+                    model_checkpoint_path,
+                    min(files, key=_checkpoint_iter_num)
+                )
+
                 print(f"Removing checkpoint: {chkpt_to_remove}")
                 os.remove(chkpt_to_remove)
+
             # model.saveCheckpoint(optimizer, losses['val'], iter_num)
             if (iter_num%eval_interval == 0):
                 model.saveCheckpoint(optimizer, losses['val'], iter_num)

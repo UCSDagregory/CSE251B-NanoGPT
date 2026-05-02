@@ -80,24 +80,20 @@ python -c "import os; print('HF_TOKEN set:', bool(os.environ.get('HF_TOKEN')))"
 echo "Repo contents:"
 ls
 
-# echo "Model folder contents:"
-# ls DG_test_initial7M
-
 echo "Starting training smoke test..."
 
-if timeout 3m python train.py \
+if timeout 5h python train.py \
   --device cuda \
-  --type scratch \
+  --type resume \
   --folder my_model \
-  --data_fd_name "https://huggingface.co/datasets/HuggingFaceFW/fineweb" \
-  --stream T \
-  --stream_config sample-10BT
+  --data_fd_name data/mixed-data \
+  --chpr checkpoints/ITER00014050_003.3023val_loss_nanoGPT_DaginGregory.pt
 then
     echo "Training finished before timeout."
 else
     code=$?
     if [ "$code" -eq 124 ]; then
-        echo "Smoke test stopped after 3m as expected."
+        echo "Training finished sucessfully."
     else
         echo "Training failed with exit code $code."
         exit "$code"
