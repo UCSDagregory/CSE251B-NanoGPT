@@ -53,8 +53,8 @@ def parse_args():
                    help="Append end-of-text token to each document")
     p.add_argument("--hf_token", type=str, default=None,
                    help="Optional Hugging Face access token for authenticated downloads")
-    p.add_argument("--shard_size", type=float, default=30.0,
-                   help="Maximum size per training shard in GB. Default: 30")
+    p.add_argument("--shard_size", type=float, default=12.0,
+                   help="Maximum size per training shard in GB. Default: 12")
     p.add_argument("--data_batch", type=float, default=2.0,
                    help="Amount of raw source data staged per cycle, expressed as a multiple of shard_size. Default: 2")
     p.add_argument("--row_group_batch_size", type=int, default=4096,
