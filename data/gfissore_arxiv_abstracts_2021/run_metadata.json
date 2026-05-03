@@ -1,0 +1,30 @@
+{
+  "append_eot": true,
+  "backend": "parquet",
+  "config": "default",
+  "dataset": "gfissore/arxiv-abstracts-2021",
+  "dtype": "uint16",
+  "encoding": "gpt2",
+  "output_dir": "gfissore_arxiv_abstracts_2021",
+  "parquet_revision": null,
+  "text_columns": [
+    "title",
+    "abstract"
+  ],
+  "train_stats": {
+    "docs_written": 1998481,
+    "downloaded_bytes": 1462627987,
+    "rows_seen": 1999486,
+    "started_at": 1777769797.2556474,
+    "text_bytes": 1968019681,
+    "tokens": 458753520
+  },
+  "val_stats": {
+    "docs_written": 1005,
+    "downloaded_bytes": 1462627987,
+    "rows_seen": 1999486,
+    "started_at": 1777770062.1968825,
+    "text_bytes": 1001687,
+    "tokens": 232888
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "append_eot": true,
+  "backend": "parquet",
+  "config": "default",
+  "dataset": "suolyer/pile_nih-exporter",
+  "dtype": "uint16",
+  "encoding": "gpt2",
+  "output_dir": "suolyer_pile_nih_exporter",
+  "parquet_revision": null,
+  "text_columns": [
+    "text"
+  ],
+  "train_stats": {
+    "docs_written": 1825,
+    "downloaded_bytes": 2157766,
+    "rows_seen": 1825,
+    "started_at": 1777770770.1630578,
+    "text_bytes": 3920667,
+    "tokens": 778513
+  },
+  "val_stats": {
+    "docs_written": 1884,
+    "downloaded_bytes": 2167954,
+    "rows_seen": 1884,
+    "started_at": 1777770771.4732215,
+    "text_bytes": 3921268,
+    "tokens": 782257
+  }
+}

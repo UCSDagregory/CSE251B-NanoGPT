@@ -6,7 +6,7 @@ import numpy as np
 import tiktoken
 
 # Example usage:
-# python data/data_mixer_novalidation.py --output data/mixed_fineweb70openweb30 --probs 0.70,0.30 --sample-chunk-bytes 16777216 --seed 1337 --overwrite data/fineweb_edu data/openwebtext
+# python data/data_mixer_novalidation.py --output data/fineweb45open15wiki15pubmed25 --probs 0.45,0.15,0.15,0.25 --sample-chunk-bytes 16777216 --seed 1337 --overwrite data/fineweb_edu data/openwebtext data/wikipedia data/pubmed
 #
 # This version randomly samples chunks from every train shard in each dataset.
 # It samples without replacement within each run, so repeated output shards do not
