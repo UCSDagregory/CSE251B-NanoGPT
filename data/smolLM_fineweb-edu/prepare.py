@@ -7,7 +7,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 import hashlib
 
-MAX_EXAMPLES = 5_000_000
+MAX_EXAMPLES = 3_000_000
 BUFFER_SIZE = 100_000
 # ---------------------------
 # Setup directories (unchanged)
