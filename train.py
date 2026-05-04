@@ -159,11 +159,19 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join(os.getcwd(), dataset)
+
+# Detect multiple train files (train0.bin, train1.bin, etc.) or single train.bin
+import glob
+train_files = sorted(glob.glob(os.path.join(data_dir, 'train*.bin')))
+if not train_files:
+    raise FileNotFoundError(f"No train*.bin files found in {data_dir}")
+print(f"Found {len(train_files)} train file(s): {[os.path.basename(f) for f in train_files]}")
+
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        # Randomly pick one of the train files
+        data_file = train_files[torch.randint(len(train_files), (1,)).item()]
+        data = np.memmap(data_file, dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -210,7 +218,7 @@ if n_params > MAX_PARAMS:
     )
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # wrap model into DDP container
 if ddp:
