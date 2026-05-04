@@ -85,7 +85,7 @@ echo "Starting training smoke test..."
 if timeout 5h python train.py \
   --device cuda \
   --type scratch \
-  --folder start_dist \
+  --folder my_model \
   --data_fd_name data/mixed-data \
   --chpn 45151525 
 then
