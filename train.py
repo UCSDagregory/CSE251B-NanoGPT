@@ -90,41 +90,39 @@ parsed_opt_args = parseOptParams(opt_path)
 if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
-
-
 # -----------------------------------------------------------------------------
-# Tuned config values for 99M param model on T4/P100 targeting <500 PPL
+# Tuned config values for 99M param model on T4/P100
 # -----------------------------------------------------------------------------
 # I/O
-eval_interval = 100       # eval every 500 iters -- saves time vs every 50
-log_interval = 10         # log every 10 iters -- less console spam
-eval_iters = 50           # 50 batches per eval -- stable loss estimates
-eval_only = False         # if True, script exits right after the first eval
-iters_per_checkpoint = 500  # save checkpoint every 2500 iters
-max_checkpoints_to_keep = 5  # keep disk usage low
+eval_interval = 100
+log_interval = 10
+eval_iters = 50
+eval_only = False
+iters_per_checkpoint = 500
+max_checkpoints_to_keep = 5
 
 # data
 dataset = args.data_fd_name
-gradient_accumulation_steps = 8  # effective batch = 32 * 4 * 1024 = 131,072 tokens/iter
-batch_size = 4            # micro-batch size -- safe for 99M params on 16GB T4/P100
-block_size = 1024         # Defined by project specs, DO NOT CHANGE
+gradient_accumulation_steps = 24  # effective batch = 24 * 4 * 1024 = 98,304 tokens/iter
+batch_size = 4                    # micro-batch size -- 99M params on 16GB T4
+block_size = 1024                 # Defined by project specs, DO NOT CHANGE
 
 # training length
-max_iters = 20050        # ~6.5B tokens seen. Adjust down if running out of time.
-grad_clip = 1.0           # clip gradients at this value, or disable if == 0.0
+max_iters = 10200                 # ~1B tokens seen (10200 * 98304 = ~1.003B)
+grad_clip = 1.0
 
 # learning rate decay settings
-decay_lr = True           # whether to decay the learning rate
-warmup_iters = 500       # longer warmup for stability at this model size
-lr_decay_iters = max_iters  # cosine decay over full training run per Chinchilla
-min_lr = 6e-5             # minimum learning rate, ~= learning_rate/10
+decay_lr = True
+warmup_iters = 500
+lr_decay_iters = max_iters
+min_lr = 6e-5
 
 # DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
+backend = 'nccl'
 # system
 device = args.device
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-compile = False  # disable torch.compile -- avoids issues on P100 and slow compilation on T4
+compile = False
 
 # -----------------------------------------------------------------------------
 
