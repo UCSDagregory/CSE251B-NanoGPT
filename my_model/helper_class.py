@@ -1,6 +1,6 @@
 import torch.nn as nn
 import torch
-from mambpa_ssm import Mamba as _MambaImpl
+from mamba_ssm import Mamba as _MambaImpl
 
 
 #This grabs the relative position of each word instead of its absolute position , called RoPE

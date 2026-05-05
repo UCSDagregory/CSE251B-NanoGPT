@@ -195,6 +195,7 @@ class nanoGPT(nn.Module):
             ITER_NUM: iter_num,
             ITER_NUM: iter_num,
         }
+        MAX_ZEROS_IN_CKPTFN = 8
         # Helps with checkpoint coherence on replacement. When a threshold is crossed, eg. 9->10 or 99->100 the checkpoints
         # will continue to stay sorted and won't have differing filename lengths
         copy_iter_num = iter_num
@@ -392,7 +393,7 @@ def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
         opt_args.append(opt_saved_config[key])
     return model_args, opt_args
 
-def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any, int]:
+
 def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any, int]:
     split_path = checkpoint_file_path.split('/')
     if (len(split_path) != 2):
