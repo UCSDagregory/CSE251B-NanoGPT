@@ -1,14 +1,6 @@
 import torch.nn as nn
 import torch
-
-try:
-    from mamba_ssm import Mamba as _MambaImpl
-    _MAMBA_BACKEND = "mamba_ssm"
-except ImportError:
-    from mambapy.mamba import Mamba as _MambaPy, MambaConfig
-    _MAMBA_BACKEND = "mambapy"
-
-print(f"[MambaBlock] backend: {_MAMBA_BACKEND}")
+from mambpa_ssm import Mamba as _MambaImpl
 
 
 #This grabs the relative position of each word instead of its absolute position , called RoPE
@@ -147,13 +139,7 @@ class MambaBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.silu = nn.SiLU()
-        if _MAMBA_BACKEND == "mamba_ssm":
-            # mamba-ssm: just the SSM layer, no internal norm/residual
-            self.mamba = _MambaImpl(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        else:
-            # mambapy: wraps a 1-layer model
-            cfg = MambaConfig(d_model=d_model, n_layers=1, d_state=d_state, d_conv=d_conv, expand_factor=expand)
-            self.mamba = _MambaPy(cfg)
+        self.mamba = _MambaImpl(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
