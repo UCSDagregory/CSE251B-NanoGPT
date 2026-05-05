@@ -1,5 +1,5 @@
 {
-    "author":"Sean Ko",
+    "author":"Dagin Gregory",
     "vocab_size":50257,
     "n_embed":576,
     "num_heads":18,

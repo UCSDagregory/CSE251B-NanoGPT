@@ -1,7 +1,0 @@
-{
-  "config": "sample-10BT",
-  "current_train_shard": "train1.bin",
-  "dataset": "HuggingFaceFW/fineweb-edu",
-  "last_completed_filename": "0013.parquet",
-  "split": "train"
-}

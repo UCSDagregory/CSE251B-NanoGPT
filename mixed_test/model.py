@@ -1,14 +1,12 @@
 import torch
 import torch.nn as nn
 import os
-import math
 import inspect
 from torch.nn import functional as F
 from typing import Any
-from helper_class import MambaBlock, CausalSelfAttentionBlock
 from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 
-#RUN WITH MPS
+
 MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
 MODEL_STATE_DICT = "model_state_dict"
@@ -16,76 +14,35 @@ OPTIMIZER_STATE_DICT = "optimizer_state_dict"
 ITER_NUM = "iter_num"
 CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
-ITER_NUM = "iter_num"
-
-# ---------------------------------------------------------------------------
-# Building blocks
-# ---------------------------------------------------------------------------
-
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (no bias, slightly faster than LayerNorm)."""
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x):
-        x_f = x.float()                                                                                                                                                                                                                                                                                                   
-        norm = x_f.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x_f * norm).type_as(x) * self.weight
-
-
-# ---------------------------------------------------------------------------
-# Main model
-# ---------------------------------------------------------------------------
+MAX_ZEROS_IN_CKPTFN = 8
 
 class nanoGPT(nn.Module):
-    def __init__(
-        self,
-        model_folder_name: str,
-        chkpt_folder_name: str = None,
-        author: str = "N/A",
-        vocab_size: int = 50257,
-        n_embd: int = 720,
-        n_head: int = 12,
-        n_layer: int = 10,
-        block_size: int = 1024,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, model_folder_name:str, chkpt_folder_name:str=None, 
+                 author:str="N/A", # Metadata args
+                 vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
+
         super().__init__()
         self.block_size = block_size
-        self.vocab_size = vocab_size
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_embd = n_embd
-
         self.token_emb = nn.Embedding(vocab_size, n_embd)
-
-        #Hybrid SSM + Transformer
-        attn_every = 6
-        blocks = []
-        for i in range(n_layer):
-            if (i + 1) % attn_every == 0:
-                blocks.append(
-                    CausalSelfAttentionBlock(d_model=n_embd, n_head=n_head, dropout=dropout)
-                )
-            else:
-                blocks.append(
-                    MambaBlock(d_model=n_embd, dropout=dropout)
-                )
-
-        self.blocks = nn.ModuleList(blocks)
-        self.drop = nn.Dropout(dropout)
-        self.ln_f = RMSNorm(n_embd)
+        self.pos_emb = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.ModuleList([
+            # nn.TransformerEncoderLayer(
+            #     d_model=n_embd, nhead=n_head,
+            #     dim_feedforward=4 * n_embd, dropout=0.1,
+            #     activation="gelu", batch_first=True,
+            # )
+            nn.TransformerEncoderLayer(
+                norm_first=True,
+                d_model=n_embd, nhead=n_head,
+                dim_feedforward=4 * n_embd, dropout=0.0,
+                activation="gelu", batch_first=True,
+            )
+            for _ in range(n_layer)
+        ])
+        self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.lm_head.weight = self.token_emb.weight # set the output and input token embeddings to be the same as it can save parameters without losing much accuracy
 
-        self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
-        self.lm_head.weight = self.token_emb.weight  # weight tying after init
-
-        #Bookkeeping parameters
         self.vocab_size = vocab_size
         self.n_layer = n_layer
         self.n_head = n_head
@@ -93,15 +50,12 @@ class nanoGPT(nn.Module):
         self.block_size = block_size
 
         self.num_parameters = sum(val.numel() for val in self.parameters())
-        print("CUSTOM TOTAL PARAMETRS: ", self.num_parameters)
         self.author = author
         self.model_path = os.path.join(os.getcwd(), model_folder_name)
-        
         if (chkpt_folder_name is None):
             self.checkpoint_folder_name = CHECKPOINT_DEFAULT
         else:
             self.checkpoint_folder_name = chkpt_folder_name
-
 
         self.opt_weight_decay = 0
         self.opt_learning_rate = 0
@@ -109,30 +63,24 @@ class nanoGPT(nn.Module):
         self.opt_device_type = 0
         self.opt_type = "muon"
 
-        print(f"Model initialized: {self.num_parameters / 1e6:.1f}M parameters")
-
-    #Set weight to normal dsitribution
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-        
-
-        
-
     def forward(self, input_ids, targets=None):
-        #B, T = input_ids.shape
-        x = self.token_emb(input_ids)
+        """
+        Args:
+            input_ids: LongTensor of shape (batch_size, seq_len)
+        Returns:
+            logits: FloatTensor of shape (batch_size, seq_len, 50257)
+        """
+        B, T = input_ids.shape
+        tok_emb = self.token_emb(input_ids)
+        pos_emb = self.pos_emb(torch.arange(T, device=input_ids.device))
+        x = tok_emb + pos_emb
 
-       #Masking and forward pass is done within the approrpriate blocks
+        # Causal mask
+        mask = torch.triu(torch.ones(T, T, device=input_ids.device), diagonal=1).bool()
+
         for block in self.blocks:
-           x = block(x)
-           
-        #x = self.drop(x)
+            x = block(x, src_mask=mask, is_causal=True)
+
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
@@ -150,7 +98,6 @@ class nanoGPT(nn.Module):
         # Training return path, wants logits and loss with respect to a target for simplicitly
         return logits, loss
 
-    
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
@@ -173,7 +120,7 @@ class nanoGPT(nn.Module):
 
     # file_name -> no extension, the needed one is added in the func. 
     # def saveCheckpoint(self, file_name:str, epoch:int, optimizer:nn.Module, loss:int):
-    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, iter_num, non_eval_checkpoint=False):
+    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, iter_num:int, non_eval_checkpoint=False):
         checkpoint = {
             MODEL_CONFIG: {
                 "author": self.author,
@@ -193,7 +140,6 @@ class nanoGPT(nn.Module):
             MODEL_STATE_DICT: self.state_dict(),
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
             ITER_NUM: iter_num,
-            ITER_NUM: iter_num,
         }
         # Helps with checkpoint coherence on replacement. When a threshold is crossed, eg. 9->10 or 99->100 the checkpoints
         # will continue to stay sorted and won't have differing filename lengths
@@ -210,7 +156,7 @@ class nanoGPT(nn.Module):
 
         save_file_name = f"ITER{prefix}{iter_num}_{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
         if (non_eval_checkpoint):
-            save_file_name = f"CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+            save_file_name = f"ITER{prefix}{iter_num}_CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
 
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
@@ -230,8 +176,6 @@ class nanoGPT(nn.Module):
 
             hidden_weights = []
             hidden_gains_biases = []
-            nonhidden_decay = []
-            nonhidden_no_decay = []
             nonhidden_decay = []
             nonhidden_no_decay = []
 
@@ -256,10 +200,6 @@ class nanoGPT(nn.Module):
                         nonhidden_decay.append(p)      # embeddings / output matrices
                     else:
                         nonhidden_no_decay.append(p)   # biases / norm scales
-                    if p.ndim >= 2:
-                        nonhidden_decay.append(p)      # embeddings / output matrices
-                    else:
-                        nonhidden_no_decay.append(p)   # biases / norm scales
                 # hidden matrix weights -> Muon
                 elif p.ndim >= 2:
                     hidden_weights.append(p)
@@ -270,11 +210,9 @@ class nanoGPT(nn.Module):
             num_hidden_weights = sum(p.numel() for p in hidden_weights)
             num_hidden_gains_biases = sum(p.numel() for p in hidden_gains_biases)
             num_nonhidden_params = sum(p.numel() for p in nonhidden_decay)
-            num_nonhidden_params = sum(p.numel() for p in nonhidden_decay)
 
             print(f"num muon parameter tensors: {len(hidden_weights)}, with {num_hidden_weights:,} parameters")
             print(f"num hidden gain/bias tensors: {len(hidden_gains_biases)}, with {num_hidden_gains_biases:,} parameters")
-            print(f"num nonhidden parameter tensors: {len(nonhidden_decay)}, with {num_nonhidden_params:,} parameters")
             print(f"num nonhidden parameter tensors: {len(nonhidden_decay)}, with {num_nonhidden_params:,} parameters")
 
             hidden_lr,nonhidden_lr = learning_rate[0], learning_rate[1]
@@ -294,36 +232,12 @@ class nanoGPT(nn.Module):
                 ),
                 dict(
                     params=nonhidden_decay,
-                    params=hidden_gains_biases + nonhidden_no_decay,
                     use_muon=False,
                     lr=nonhidden_lr,
                     betas=betas,
-                    weight_decay=0.0,
-                ),
-                dict(
-                    params=nonhidden_decay,
-                    use_muon=False,
-                    lr=nonhidden_lr,
-                    betas=betas,
-                    weight_decay=weight_decay,  # or smaller, e.g. 0.01
                     weight_decay=weight_decay,  # or smaller, e.g. 0.01
                 ),
             ]
-            # param_groups = [
-            #     dict(
-            #         params=hidden_weights,
-            #         use_muon=True,
-            #         lr=hidden_lr,
-            #         weight_decay=weight_decay,
-            #     ),
-            #     dict(
-            #         params=hidden_gains_biases + nonhidden_no_decay + nonhidden_decay,
-            #         use_muon=False,
-            #         lr=nonhidden_lr,
-            #         betas=betas,
-            #         weight_decay=weight_decay,
-            #     ),
-            # ]
 
             use_distributed_muon = (
                 torch.distributed.is_available()
@@ -393,7 +307,6 @@ def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
     return model_args, opt_args
 
 def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any, int]:
-def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any, int]:
     split_path = checkpoint_file_path.split('/')
     if (len(split_path) != 2):
         raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
@@ -408,9 +321,7 @@ def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple
     model_sd = checkpoint[MODEL_STATE_DICT]
     opt_sd = checkpoint[OPTIMIZER_STATE_DICT]
     iter_num = checkpoint[ITER_NUM]
-    iter_num = checkpoint[ITER_NUM]
     checkpoint = None
-    return gpt_model, model_sd, opt_args, opt_sd, iter_num
     return gpt_model, model_sd, opt_args, opt_sd, iter_num
 
 # --- Required: load_model function ---
@@ -435,7 +346,6 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     model_args, opt_args = getArgs(checkpoint)
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
-    checkpoint = None
     checkpoint = None
     print(f"#Params: {model.num_parameters}")
     model.to(device)

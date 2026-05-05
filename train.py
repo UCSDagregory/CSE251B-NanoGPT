@@ -32,6 +32,8 @@ import train_helper_loader as th_loader
 import argparse
 
 import json
+import re
+
 
 TRAIN_HELPER_FILENAME = "train_helper.py"
 OPT_FILENAME = "training_opt_params.json"
@@ -65,6 +67,8 @@ parser.add_argument("--chpn", required=False) # folder_name to save checkpoints,
 parser.add_argument("--chpr", required=False) # folder_name/checkpoint_file_name
 parser.add_argument("--opt_name", required=False)
 parser.add_argument("--data_collection", required=False)
+parser.add_argument("--stream", required=False, default='F') # if T then will use streaming rather than looking for files on disk
+parser.add_argument("--stream_config", required=False, default=None)
 
 args = parser.parse_args()
 
@@ -93,12 +97,19 @@ parsed_opt_args = parseOptParams(opt_path)
 if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
-# eval_interval = 2000
-eval_interval = 100 # How many iters until re-calculate val. loss
-# eval_interval = 5
-log_interval = 100
-eval_iters = 100# How many times to calculate val.loss per 'eval interval'
-# eval_iters = 5
+is_streaming = False
+if (args.stream == 'T'):
+    is_streaming = True
+
+streaming_config = args.stream_config
+if (not args.stream_config is None):
+    if (not is_streaming):
+        raise ValueError("Not allowed to define a stream config when not streaming.")
+    streaming_config = args.stream_config
+
+eval_interval = 150 # How many iters until re-calculate val. loss
+log_interval = 1
+eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 # iters_per_checkpoint = 5
@@ -191,8 +202,12 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-data_dir = os.path.join(os.getcwd(), dataset)
-batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type)
+if (is_streaming):
+    data_dir = dataset
+else:
+    data_dir = os.path.join(os.getcwd(), dataset)
+# batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type)
+batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type, streaming=is_streaming, streaming_config_name=streaming_config)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -221,8 +236,11 @@ else:
     raise ValueError("Unknown input for --type")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-
+# scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
+if hasattr(torch.amp, "GradScaler"):
+    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
+else:
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
 # wrap model into DDP container
 if ddp:
@@ -296,96 +314,282 @@ tokens_parsed = 0.0
 losses = {}
 losses['val'] = 999.0
 print(f"Warmup iters for:{warmup_iters}\n")
+# while True:
+#     total_tokens_processed = iter_num*effective_batch_size*block_size
+#     print(f"Tokens processed:{total_tokens_processed} | {total_tokens_processed:.2e}\n")
+
+#     # determine and set the learning rate for this iteration
+#     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
+#     # lr = get_lr(iter_num)
+
+#     if OPT_TYPE == "adam":
+#         for param_group in optimizer.param_groups:
+#             param_group["lr"] = lr
+#     elif OPT_TYPE == "muon":
+#         hidden_lr, nonhidden_lr = lr
+#         optimizer.param_groups[0]["lr"] = hidden_lr
+#         optimizer.param_groups[1]["lr"] = nonhidden_lr
+#     else:
+#         raise ValueError("Something is incorrect with learning rate or optimizer type. Adam is a single scalar: ..., Muon is a list: [...]")
+
+#     # evaluate the loss on train/val sets and write checkpoints
+#     if iter_num%eval_interval == 0 and master_process:
+#         losses = estimate_loss()
+#         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+
+#     if iter_num%iters_per_checkpoint == 0 or (iter_num%eval_interval == 0 and losses['val'] < best_val_loss):
+#         best_val_loss = losses['val']
+#         if iter_num >= 0:
+#             print(f"Current val loss:{losses['val']:.4f}")
+#             current_checkpoints = len(os.listdir(model_checkpoint_path))
+#             if (current_checkpoints >= max_checkpoints_to_keep):
+#                 def _checkpoint_iter_num(filename):
+#                     match = re.search(r"ITER0*(\d+)", filename)
+#                     if match is None:
+#                         raise ValueError(f"Could not parse iteration number from checkpoint filename: {filename}")
+#                     return int(match.group(1))
+
+#                 files = [
+#                     f for f in os.listdir(model_checkpoint_path)
+#                     if os.path.isfile(os.path.join(model_checkpoint_path, f))
+#                 ]
+
+#                 chkpt_to_remove = os.path.join(
+#                     model_checkpoint_path,
+#                     min(files, key=_checkpoint_iter_num)
+#                 )
+
+#                 print(f"Removing checkpoint: {chkpt_to_remove}")
+#                 os.remove(chkpt_to_remove)
+
+#             # model.saveCheckpoint(optimizer, losses['val'], iter_num)
+#             if (iter_num%eval_interval == 0):
+#                 model.saveCheckpoint(optimizer, losses['val'], iter_num)
+#                 with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
+#                     f.write(f"{total_tokens_processed},{iter_num},{losses['val']:.4f}\n")
+#             else:
+#                 model.saveCheckpoint(optimizer, lossf, iter_num)
+#             # if (not args.data_collection is None):
+#             # Just save to training data as a default
+#             #with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
+#             #    f.write(f"{total_tokens_processed},{iter_num},{lossf:.4f}\n")
+#     if iter_num == 0 and eval_only:
+#         break
+
+#     # forward backward update, with optional gradient accumulation to simulate larger batch size
+#     # and using the GradScaler if data type is float16
+#     for micro_step in range(gradient_accumulation_steps):
+#         print(f"Microstep:{micro_step}\n")
+#         if ddp:
+#             # in DDP training we only need to sync gradients at the last micro step.
+#             # the official way to do this is with model.no_sync() context manager, but
+#             # I really dislike that this bloats the code and forces us to repeat code
+#             # looking at the source of that context manager, it just toggles this variable
+#             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+#         with ctx:
+#             logits, loss = model(X, Y)
+#             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+#         # immediately async prefetch next batch while model is doing the forward pass on the GPU
+#         X, Y = batch_helper.get_batch('train')
+#         # backward pass, with gradient scaling if training in fp16
+#         scaler.scale(loss).backward()
+#     # clip the gradient
+#     if grad_clip != 0.0:
+#         scaler.unscale_(optimizer)
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+#     # step the optimizer and scaler if training in fp16
+#     scaler.step(optimizer)
+#     scaler.update()
+#     # flush the gradients as soon as we can, no need for this memory anymore
+#     optimizer.zero_grad(set_to_none=True)
+
+#     # timing and logging
+#     t1 = time.time()
+#     dt = t1 - t0
+#     t0 = t1
+#     if iter_num % log_interval == 0 and master_process:
+#         # get loss as float. note: this is a CPU-GPU sync point
+#         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+#         lossf = loss.item() * gradient_accumulation_steps
+#         if local_iter_num >= 5: # let the training loop settle a bit
+#             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+#             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+#         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+#     iter_num += 1
+#     local_iter_num += 1
+
+#     # termination conditions
+#     if iter_num > max_iters:
+#         break
+
+# if ddp:
+#     destroy_process_group()
+
 while True:
-    total_tokens_processed = iter_num*effective_batch_size*block_size
+    total_tokens_processed = iter_num * effective_batch_size * block_size
     print(f"Tokens processed:{total_tokens_processed} | {total_tokens_processed:.2e}\n")
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
-    # lr = get_lr(iter_num)
 
     if OPT_TYPE == "adam":
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
+
     elif OPT_TYPE == "muon":
         hidden_lr, nonhidden_lr = lr
-        optimizer.param_groups[0]["lr"] = hidden_lr
-        optimizer.param_groups[1]["lr"] = nonhidden_lr
-        optimizer.param_groups[2]["lr"] = nonhidden_lr
+
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = (
+                hidden_lr if param_group.get("use_muon", False)
+                else nonhidden_lr
+            )
+
     else:
-        raise ValueError("Something is incorrect with learning rate or optimizer type. Adam is a single scalar: ..., Muon is a list: [...]")
+        raise ValueError(
+            "Invalid optimizer type. Adam expects scalar lr; Muon expects "
+            "(hidden_lr, nonhidden_lr)."
+        )
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num%eval_interval == 0 and master_process:
+    # evaluate the loss on train/val sets
+    losses = None
+
+    if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(
+            f"step {iter_num}: "
+            f"train loss {losses['train']:.4f}, "
+            f"val loss {losses['val']:.4f}"
+        )
 
-    if iter_num%iters_per_checkpoint == 0 or (iter_num%eval_interval == 0 and losses['val'] < best_val_loss):
-        best_val_loss = losses['val']
-        if iter_num >= 0:
-            print(f"Current val loss:{losses['val']:.4f}")
+        if losses["val"] < best_val_loss:
+            best_val_loss = losses["val"]
+
+            print(f"Current val loss: {losses['val']:.4f}")
+
             current_checkpoints = len(os.listdir(model_checkpoint_path))
-            if (current_checkpoints >= max_checkpoints_to_keep):
-                files = os.listdir(model_checkpoint_path) # pseudo sorted because the val. loss is expected to decrease with time
-                # chkpt_to_remove = os.path.join(model_checkpoint_path, files[len(files)-1])
-                chkpt_to_remove = os.path.join(model_checkpoint_path, files[0]) # we remove the first since we store the iter num in the file name now since it's a better indicator of performance
+
+            if current_checkpoints >= max_checkpoints_to_keep:
+                def _checkpoint_iter_num(filename):
+                    match = re.search(r"ITER0*(\d+)", filename)
+                    if match is None:
+                        raise ValueError(
+                            f"Could not parse iteration number from checkpoint filename: {filename}"
+                        )
+                    return int(match.group(1))
+
+                files = [
+                    f for f in os.listdir(model_checkpoint_path)
+                    if os.path.isfile(os.path.join(model_checkpoint_path, f))
+                ]
+
+                chkpt_to_remove = os.path.join(
+                    model_checkpoint_path,
+                    min(files, key=_checkpoint_iter_num),
+                )
+
                 print(f"Removing checkpoint: {chkpt_to_remove}")
                 os.remove(chkpt_to_remove)
-            # model.saveCheckpoint(optimizer, losses['val'], iter_num)
-            if (iter_num%eval_interval == 0):
-                model.saveCheckpoint(optimizer, losses['val'], iter_num)
-            else:
-                model.saveCheckpoint(optimizer, lossf, iter_num)
-            # if (not args.data_collection is None):
-            # Just save to training data as a default
-            with open(os.path.join(model_path, "training_data.txt"), mode='a') as f:
-                f.write(f"{total_tokens_processed},{iter_num},{lossf:.4f}\n")
+
+            model.saveCheckpoint(optimizer, losses["val"], iter_num)
+
+            with open(os.path.join(model_path, "training_data.txt"), mode="a") as f:
+                f.write(
+                    f"{total_tokens_processed},"
+                    f"{iter_num},"
+                    f"{losses['val']:.4f}\n"
+                )
+
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
+    # forward/backward update with gradient accumulation
     for micro_step in range(gradient_accumulation_steps):
         #print(f"Microstep:{micro_step}\n")
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            model.require_backward_grad_sync = (
+                micro_step == gradient_accumulation_steps - 1
+            )
+
         with ctx:
             logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = batch_helper.get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+            loss = loss / gradient_accumulation_steps
+
+        X, Y = batch_helper.get_batch("train")
+
         scaler.scale(loss).backward()
-    # clip the gradient
+
+    # clip gradients
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
+
+    # optimizer step
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
+
+    lossf = loss.item() * gradient_accumulation_steps
+
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if local_iter_num >= 5:
+            mfu = raw_model.estimate_mfu(
+                batch_size * gradient_accumulation_steps,
+                dt,
+            )
+            running_mfu = (
+                mfu if running_mfu == -1.0
+                else 0.9 * running_mfu + 0.1 * mfu
+            )
+
+        print(
+            f"iter {iter_num}: "
+            f"loss {lossf:.4f}, "
+            f"time {dt * 1000:.2f}ms, "
+            f"mfu {running_mfu * 100:.2f}%"
+        )
+
+    # periodic checkpoint based on latest train loss
+    if (
+        iter_num % iters_per_checkpoint == 0
+        and iter_num > 0
+        and master_process
+    ):
+        current_checkpoints = len(os.listdir(model_checkpoint_path))
+
+        if current_checkpoints >= max_checkpoints_to_keep:
+            def _checkpoint_iter_num(filename):
+                match = re.search(r"ITER0*(\d+)", filename)
+                if match is None:
+                    raise ValueError(
+                        f"Could not parse iteration number from checkpoint filename: {filename}"
+                    )
+                return int(match.group(1))
+
+            files = [
+                f for f in os.listdir(model_checkpoint_path)
+                if os.path.isfile(os.path.join(model_checkpoint_path, f))
+            ]
+
+            chkpt_to_remove = os.path.join(
+                model_checkpoint_path,
+                min(files, key=_checkpoint_iter_num),
+            )
+
+            print(f"Removing checkpoint: {chkpt_to_remove}")
+            os.remove(chkpt_to_remove)
+
+        model.saveCheckpoint(optimizer, lossf, iter_num)
+
     iter_num += 1
     local_iter_num += 1
 
-    # termination conditions
     if iter_num > max_iters:
         break
 
