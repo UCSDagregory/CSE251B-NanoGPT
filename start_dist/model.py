@@ -74,6 +74,7 @@ class nanoGPT(nn.Module):
         n_head=4,
         n_layer=2,
         block_size=1024,
+        resume=False
     ):
         super().__init__()
 
@@ -103,7 +104,8 @@ class nanoGPT(nn.Module):
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
         # GPT-style init.
-        self.apply(self._init_weights)
+        if (not resume):
+            self.apply(self._init_weights)
 
         # GPT-2-style residual projection scaling.
         #
@@ -393,11 +395,12 @@ class nanoGPT(nn.Module):
         
         raise ValueError(f"Invalid optimizer type: {optimizer_type}")
 
-def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A"):
+def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A", resume=False):
     model_args = [model_folder_name, chkpt_folder_name]
     model_saved_config = checkpoint[MODEL_CONFIG]
     for key in model_saved_config:
         model_args.append(model_saved_config[key])
+    model_args.append(resume)
     opt_args = []
     opt_saved_config = checkpoint[OPT_CONFIG]
     for key in opt_saved_config:
@@ -411,8 +414,7 @@ def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple
     chkpt_folder_name, ckpt_file_name  = split_path
     load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
     checkpoint = torch.load(load_path, weights_only=True)
-    model_args, opt_args = getArgs(checkpoint, model_folder_name, chkpt_folder_name)
-
+    model_args, opt_args = getArgs(checkpoint, model_folder_name, chkpt_folder_name, resume=True)
     gpt_model = nanoGPT(*model_args)
     gpt_model.checkpoint_folder_name = chkpt_folder_name
     
@@ -441,7 +443,7 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     """
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model_args, opt_args = getArgs(checkpoint)
+    model_args, opt_args = getArgs(checkpoint, resume=True)
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
     checkpoint = None
