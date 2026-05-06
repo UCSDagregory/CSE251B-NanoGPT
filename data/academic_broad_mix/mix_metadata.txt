@@ -1,0 +1,15 @@
+encoding	gpt2
+dtype	uint16
+itemsize	2
+total_train_bytes	13107243402
+max_output_bytes	23622320128
+sample_chunk_bytes	16777216
+seed	1337
+sampling	without_replacement_random_chunks
+dataset	probability	target_train_bytes
+G:\CSE251B-NanoGPT\data\fineweb_edu	0.2	2621448680
+G:\CSE251B-NanoGPT\data\openwebtext	0.08	1048579472
+G:\CSE251B-NanoGPT\data\wikipedia	0.1	1310724340
+G:\CSE251B-NanoGPT\data\pubmed	0.2	2621448680
+G:\CSE251B-NanoGPT\data\allenai_peS2o_40gb	0.35	4587535190
+G:\CSE251B-NanoGPT\data\gfissore_arxiv_abstracts_2021	0.07	917507040

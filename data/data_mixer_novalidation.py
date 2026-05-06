@@ -206,6 +206,72 @@ def compute_dataset_targets(total_output_bytes, probs, itemsize):
     return targets
 
 
+def compute_fit_dataset_targets(total_output_bytes, probs, dataset_bytes, itemsize):
+    """
+    Compute per-dataset byte targets that sum to total_output_bytes and do not
+    exceed the available bytes in any dataset.
+
+    The plain target computation can assign a small rounding remainder to the
+    last nonzero-probability dataset. If that dataset is the limiting dataset,
+    this can exceed availability by a few aligned bytes. This helper reduces
+    total_output_bytes until the rounded target allocation fits all datasets.
+    """
+    total_output_bytes = align_down(total_output_bytes, itemsize)
+
+    while total_output_bytes > 0:
+        targets = compute_dataset_targets(
+            total_output_bytes=total_output_bytes,
+            probs=probs,
+            itemsize=itemsize,
+        )
+
+        fits = True
+        for target, available in zip(targets, dataset_bytes):
+            if target > align_down(available, itemsize):
+                fits = False
+                break
+
+        if fits:
+            return total_output_bytes, targets
+
+        total_output_bytes -= itemsize
+        total_output_bytes = align_down(total_output_bytes, itemsize)
+
+    raise ValueError("Computed output size is zero after fitting dataset targets.")
+
+
+def compute_shard_plan_from_remaining(current_shard_size, remaining_by_dataset, itemsize):
+    """
+    Build a shard plan directly from the remaining global dataset targets.
+
+    This avoids requesting more bytes from a dataset than its global target has
+    left, while preserving the requested total shard size whenever possible.
+    """
+    current_shard_size = align_down(current_shard_size, itemsize)
+
+    if current_shard_size <= 0:
+        return [0 for _ in remaining_by_dataset]
+
+    shard_plan = [0 for _ in remaining_by_dataset]
+    deficit = current_shard_size
+
+    for i, remaining in enumerate(remaining_by_dataset):
+        if deficit <= 0:
+            break
+
+        available = align_down(remaining, itemsize)
+        if available <= 0:
+            continue
+
+        amount = min(deficit, available)
+        amount = align_down(amount, itemsize)
+
+        shard_plan[i] = amount
+        deficit -= amount
+
+    return shard_plan
+
+
 def compute_shard_plan(current_shard_size, probs, itemsize):
     plan = []
     assigned = 0
@@ -400,9 +466,10 @@ def write_mixed_train_shards(
         itemsize=itemsize,
     )
 
-    dataset_targets = compute_dataset_targets(
+    total_output_bytes, dataset_targets = compute_fit_dataset_targets(
         total_output_bytes=total_output_bytes,
         probs=probs,
+        dataset_bytes=dataset_bytes,
         itemsize=itemsize,
     )
 
@@ -433,15 +500,13 @@ def write_mixed_train_shards(
         if current_shard_size <= 0:
             break
 
-        requested_plan = compute_shard_plan(current_shard_size, probs, itemsize)
+        shard_plan = compute_shard_plan(current_shard_size, probs, itemsize)
 
-        shard_plan = []
         assigned = 0
-
-        for i, requested_amount in enumerate(requested_plan):
+        for i, requested_amount in enumerate(shard_plan):
             amount = min(requested_amount, remaining_by_dataset[i])
             amount = align_down(amount, itemsize)
-            shard_plan.append(amount)
+            shard_plan[i] = amount
             assigned += amount
 
         deficit = current_shard_size - assigned

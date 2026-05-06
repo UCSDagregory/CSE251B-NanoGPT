@@ -1,0 +1,11 @@
+encoding	gpt2
+dtype	uint16
+itemsize	2
+total_train_bytes	23622320128
+max_output_bytes	23622320128
+sample_chunk_bytes	16777216
+seed	1337
+sampling	without_replacement_random_chunks
+dataset	probability	target_train_bytes
+G:\CSE251B-NanoGPT\data\fineweb_edu	0.7	16535624088
+G:\CSE251B-NanoGPT\data\openwebtext	0.3	7086696040
