@@ -87,7 +87,7 @@ if timeout 5h python train.py \
   --type scratch \
   --folder start_dist \
   --data_fd_name data/mixed-data \
-  --chpn 45151525 
+  --chpn TEST
 then
     echo "Training finished before timeout."
 else
