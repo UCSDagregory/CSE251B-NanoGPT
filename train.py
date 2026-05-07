@@ -425,6 +425,360 @@ print(f"Warmup iters for:{warmup_iters}\n")
 # if ddp:
 #     destroy_process_group()
 
+# while True:
+#     total_tokens_processed = iter_num * effective_batch_size * block_size
+#     print(f"Tokens processed:{total_tokens_processed} | {total_tokens_processed:.2e}\n")
+
+#     # determine and set the learning rate for this iteration
+#     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
+
+#     if OPT_TYPE == "adam":
+#         for param_group in optimizer.param_groups:
+#             param_group["lr"] = lr
+
+#     elif OPT_TYPE == "muon":
+#         hidden_lr, nonhidden_lr = lr
+
+#         for param_group in optimizer.param_groups:
+#             param_group["lr"] = (
+#                 hidden_lr if param_group.get("use_muon", False)
+#                 else nonhidden_lr
+#             )
+
+#     else:
+#         raise ValueError(
+#             "Invalid optimizer type. Adam expects scalar lr; Muon expects "
+#             "(hidden_lr, nonhidden_lr)."
+#         )
+
+#     # evaluate the loss on train/val sets
+#     losses = None
+
+#     if iter_num % eval_interval == 0 and master_process:
+#         losses = estimate_loss()
+#         print(
+#             f"step {iter_num}: "
+#             f"train loss {losses['train']:.4f}, "
+#             f"val loss {losses['val']:.4f}"
+#         )
+
+#         if losses["val"] < best_val_loss:
+#             best_val_loss = losses["val"]
+
+#             print(f"Current val loss: {losses['val']:.4f}")
+
+#             current_checkpoints = len(os.listdir(model_checkpoint_path))
+
+#             if current_checkpoints >= max_checkpoints_to_keep:
+#                 def _checkpoint_iter_num(filename):
+#                     match = re.search(r"ITER0*(\d+)", filename)
+#                     if match is None:
+#                         raise ValueError(
+#                             f"Could not parse iteration number from checkpoint filename: {filename}"
+#                         )
+#                     return int(match.group(1))
+
+#                 files = [
+#                     f for f in os.listdir(model_checkpoint_path)
+#                     if os.path.isfile(os.path.join(model_checkpoint_path, f))
+#                 ]
+
+#                 chkpt_to_remove = os.path.join(
+#                     model_checkpoint_path,
+#                     min(files, key=_checkpoint_iter_num),
+#                 )
+
+#                 print(f"Removing checkpoint: {chkpt_to_remove}")
+#                 os.remove(chkpt_to_remove)
+
+#             model.saveCheckpoint(optimizer, losses["val"], iter_num)
+
+#             with open(os.path.join(model_path, "training_data.txt"), mode="a") as f:
+#                 f.write(
+#                     f"{total_tokens_processed},"
+#                     f"{iter_num},"
+#                     f"{losses['val']:.4f}\n"
+#                 )
+
+#     if iter_num == 0 and eval_only:
+#         break
+
+#     # forward/backward update with gradient accumulation
+#     for micro_step in range(gradient_accumulation_steps):
+#         print(f"Microstep:{micro_step}\n")
+
+#         if ddp:
+#             model.require_backward_grad_sync = (
+#                 micro_step == gradient_accumulation_steps - 1
+#             )
+
+#         with ctx:
+#             logits, loss = model(X, Y)
+#             loss = loss / gradient_accumulation_steps
+
+#         X, Y = batch_helper.get_batch("train")
+
+#         scaler.scale(loss).backward()
+
+#     # clip gradients
+#     if grad_clip != 0.0:
+#         scaler.unscale_(optimizer)
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+#     # optimizer step
+#     scaler.step(optimizer)
+#     scaler.update()
+#     optimizer.zero_grad(set_to_none=True)
+
+#     # timing and logging
+#     t1 = time.time()
+#     dt = t1 - t0
+#     t0 = t1
+
+#     lossf = loss.item() * gradient_accumulation_steps
+
+#     if iter_num % log_interval == 0 and master_process:
+#         if local_iter_num >= 5:
+#             mfu = raw_model.estimate_mfu(
+#                 batch_size * gradient_accumulation_steps,
+#                 dt,
+#             )
+#             running_mfu = (
+#                 mfu if running_mfu == -1.0
+#                 else 0.9 * running_mfu + 0.1 * mfu
+#             )
+
+#         print(
+#             f"iter {iter_num}: "
+#             f"loss {lossf:.4f}, "
+#             f"time {dt * 1000:.2f}ms, "
+#             f"mfu {running_mfu * 100:.2f}%"
+#         )
+
+#     # periodic checkpoint based on latest train loss
+#     if (
+#         iter_num % iters_per_checkpoint == 0
+#         and iter_num > 0
+#         and master_process
+#     ):
+#         current_checkpoints = len(os.listdir(model_checkpoint_path))
+
+#         if current_checkpoints >= max_checkpoints_to_keep:
+#             def _checkpoint_iter_num(filename):
+#                 match = re.search(r"ITER0*(\d+)", filename)
+#                 if match is None:
+#                     raise ValueError(
+#                         f"Could not parse iteration number from checkpoint filename: {filename}"
+#                     )
+#                 return int(match.group(1))
+
+#             files = [
+#                 f for f in os.listdir(model_checkpoint_path)
+#                 if os.path.isfile(os.path.join(model_checkpoint_path, f))
+#             ]
+
+#             chkpt_to_remove = os.path.join(
+#                 model_checkpoint_path,
+#                 min(files, key=_checkpoint_iter_num),
+#             )
+
+#             print(f"Removing checkpoint: {chkpt_to_remove}")
+#             os.remove(chkpt_to_remove)
+
+#         model.saveCheckpoint(optimizer, lossf, iter_num)
+
+#     iter_num += 1
+#     local_iter_num += 1
+
+#     if iter_num > max_iters:
+#         break
+
+# if ddp:
+#     destroy_process_group()
+
+def _checkpoint_iter_num(path_or_name):
+    name = Path(path_or_name).name
+    match = re.search(r"ITER0*(\d+)", name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _checkpoint_files(checkpoint_dir):
+    checkpoint_dir = Path(checkpoint_dir)
+    files = []
+
+    if not checkpoint_dir.exists():
+        return files
+
+    for p in checkpoint_dir.iterdir():
+        if not p.is_file():
+            continue
+
+        # Ignore failed/partial checkpoint writes.
+        if p.name.endswith((".tmp", ".partial", ".bak")):
+            continue
+
+        # Only manage files that look like iteration checkpoints.
+        if _checkpoint_iter_num(p.name) is not None:
+            files.append(p)
+
+    return files
+
+
+def _cleanup_stale_temp_checkpoints(checkpoint_dir):
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if not checkpoint_dir.exists():
+        return
+
+    for p in checkpoint_dir.iterdir():
+        if p.is_file() and p.name.endswith((".tmp", ".partial")):
+            try:
+                print(f"Removing stale temp checkpoint: {p}")
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _free_bytes(path):
+    return shutil.disk_usage(path).free
+
+
+def _enforce_checkpoint_limit_before_save(
+    checkpoint_dir,
+    max_checkpoints_to_keep,
+    min_free_bytes_before_save=0,
+):
+    """
+    Delete old checkpoints BEFORE writing the next one.
+
+    This avoids the bad pattern:
+        write huge new checkpoint -> hit quota -> crash -> old checkpoint still present
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    _cleanup_stale_temp_checkpoints(checkpoint_dir)
+
+    files = sorted(
+        _checkpoint_files(checkpoint_dir),
+        key=lambda p: _checkpoint_iter_num(p.name),
+    )
+
+    # Since we are about to add one checkpoint, keep at most max-1 old ones.
+    keep_existing = max(0, max_checkpoints_to_keep - 1)
+
+    while len(files) > keep_existing:
+        victim = files.pop(0)
+        try:
+            print(f"Removing old checkpoint before save: {victim}")
+            victim.unlink()
+        except FileNotFoundError:
+            pass
+
+    # If still below reserve, delete more old checkpoints.
+    while (
+        min_free_bytes_before_save > 0
+        and _free_bytes(checkpoint_dir) < min_free_bytes_before_save
+        and files
+    ):
+        victim = files.pop(0)
+        try:
+            print(f"Removing checkpoint to satisfy free-space reserve: {victim}")
+            victim.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def save_checkpoint_atomic(
+    model,
+    optimizer,
+    loss_value,
+    iter_num,
+    checkpoint_dir,
+    max_checkpoints_to_keep,
+    *,
+    raw_model=None,
+    scaler=None,
+    extra_state=None,
+    min_free_gb_before_save=0.25,
+):
+    """
+    Safe checkpoint save.
+
+    - Deletes old checkpoints before saving.
+    - Writes to a hidden .tmp file first.
+    - fsyncs the temp file.
+    - Atomically renames temp -> final.
+    - Cleans failed temp files on error.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    min_free_bytes = int(min_free_gb_before_save * 1024**3)
+
+    _enforce_checkpoint_limit_before_save(
+        checkpoint_dir=checkpoint_dir,
+        max_checkpoints_to_keep=max_checkpoints_to_keep,
+        min_free_bytes_before_save=min_free_bytes,
+    )
+
+    model_to_save = raw_model if raw_model is not None else model
+
+    final_path = checkpoint_dir / f"ckpt_ITER{iter_num:08d}.pt"
+    tmp_path = checkpoint_dir / f".ckpt_ITER{iter_num:08d}.{os.getpid()}.tmp"
+
+    state = {
+        "iter_num": iter_num,
+        "loss": float(loss_value),
+        "model_state_dict": model_to_save.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+
+    if scaler is not None:
+        state["scaler_state_dict"] = scaler.state_dict()
+
+    if extra_state is not None:
+        state["extra_state"] = extra_state
+
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+        torch.save(state, tmp_path)
+
+        with open(tmp_path, "rb") as f:
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, final_path)
+
+        try:
+            dir_fd = os.open(checkpoint_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+
+        print(f"Saved checkpoint atomically: {final_path}")
+
+    except OSError as e:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+        free_gb = _free_bytes(checkpoint_dir) / 1024**3
+        raise RuntimeError(
+            f"Atomic checkpoint save failed at iter {iter_num}. "
+            f"Free space in checkpoint directory: {free_gb:.2f} GB. "
+            f"Checkpoint dir: {checkpoint_dir}. Original error: {e}"
+        ) from e
+
+
 while True:
     total_tokens_processed = iter_num * effective_batch_size * block_size
     print(f"Tokens processed:{total_tokens_processed} | {total_tokens_processed:.2e}\n")
@@ -467,31 +821,22 @@ while True:
 
             print(f"Current val loss: {losses['val']:.4f}")
 
-            current_checkpoints = len(os.listdir(model_checkpoint_path))
-
-            if current_checkpoints >= max_checkpoints_to_keep:
-                def _checkpoint_iter_num(filename):
-                    match = re.search(r"ITER0*(\d+)", filename)
-                    if match is None:
-                        raise ValueError(
-                            f"Could not parse iteration number from checkpoint filename: {filename}"
-                        )
-                    return int(match.group(1))
-
-                files = [
-                    f for f in os.listdir(model_checkpoint_path)
-                    if os.path.isfile(os.path.join(model_checkpoint_path, f))
-                ]
-
-                chkpt_to_remove = os.path.join(
-                    model_checkpoint_path,
-                    min(files, key=_checkpoint_iter_num),
-                )
-
-                print(f"Removing checkpoint: {chkpt_to_remove}")
-                os.remove(chkpt_to_remove)
-
-            model.saveCheckpoint(optimizer, losses["val"], iter_num)
+            save_checkpoint_atomic(
+                model=model,
+                raw_model=raw_model if "raw_model" in globals() else None,
+                optimizer=optimizer,
+                scaler=scaler,
+                loss_value=losses["val"],
+                iter_num=iter_num,
+                checkpoint_dir=model_checkpoint_path,
+                max_checkpoints_to_keep=max_checkpoints_to_keep,
+                extra_state={
+                    "best_val_loss": best_val_loss,
+                    "checkpoint_type": "best_val",
+                    "total_tokens_processed": total_tokens_processed,
+                },
+                min_free_gb_before_save=0.25,
+            )
 
             with open(os.path.join(model_path, "training_data.txt"), mode="a") as f:
                 f.write(
@@ -561,31 +906,22 @@ while True:
         and iter_num > 0
         and master_process
     ):
-        current_checkpoints = len(os.listdir(model_checkpoint_path))
-
-        if current_checkpoints >= max_checkpoints_to_keep:
-            def _checkpoint_iter_num(filename):
-                match = re.search(r"ITER0*(\d+)", filename)
-                if match is None:
-                    raise ValueError(
-                        f"Could not parse iteration number from checkpoint filename: {filename}"
-                    )
-                return int(match.group(1))
-
-            files = [
-                f for f in os.listdir(model_checkpoint_path)
-                if os.path.isfile(os.path.join(model_checkpoint_path, f))
-            ]
-
-            chkpt_to_remove = os.path.join(
-                model_checkpoint_path,
-                min(files, key=_checkpoint_iter_num),
-            )
-
-            print(f"Removing checkpoint: {chkpt_to_remove}")
-            os.remove(chkpt_to_remove)
-
-        model.saveCheckpoint(optimizer, lossf, iter_num)
+        save_checkpoint_atomic(
+            model=model,
+            raw_model=raw_model if "raw_model" in globals() else None,
+            optimizer=optimizer,
+            scaler=scaler,
+            loss_value=lossf,
+            iter_num=iter_num,
+            checkpoint_dir=model_checkpoint_path,
+            max_checkpoints_to_keep=max_checkpoints_to_keep,
+            extra_state={
+                "best_val_loss": best_val_loss,
+                "checkpoint_type": "periodic",
+                "total_tokens_processed": total_tokens_processed,
+            },
+            min_free_gb_before_save=0.25,
+        )
 
     iter_num += 1
     local_iter_num += 1
