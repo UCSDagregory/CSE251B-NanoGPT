@@ -334,7 +334,7 @@ class nanoGPT(nn.Module):
                     use_muon=False,
                     lr=nonhidden_lr,
                     betas=betas,
-                    weight_decay=weight_decay,  # or smaller, e.g. 0.01
+                    weight_decay=0.0,  # or smaller, e.g. 0.01
                 ),
             ]
 
