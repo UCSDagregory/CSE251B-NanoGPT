@@ -115,7 +115,7 @@ eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 iters_per_checkpoint = 10
-max_checkpoints_to_keep = 5 
+max_checkpoints_to_keep = 2 
 
 dataset = args.data_fd_name
 effective_batch_size = 96
@@ -133,7 +133,7 @@ effective_batch_size = 96
 # It's been changed s.t. the user now fixes effective_batch_size to a number they deem reasonable for clean gradients and batch_size to ensure training is as performant as possible
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
-batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
