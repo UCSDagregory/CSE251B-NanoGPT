@@ -82,7 +82,7 @@ ls
 
 echo "Starting training smoke test..."
 
-if timeout 5h python train.py \
+if timeout 12h python train.py \
   --device cuda \
   --type scratch \
   --folder start_dist \
