@@ -104,7 +104,7 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 # iters_per_checkpoint = 5
 iters_per_checkpoint = 15
 # max_checkpoints_to_keep = 25
-max_checkpoints_to_keep = 60
+max_checkpoints_to_keep = 10
 
 dataset = args.data_fd_name
 effective_batch_size = 96
@@ -123,7 +123,7 @@ effective_batch_size = 96
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 10 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -132,7 +132,7 @@ print(f"Gradient accumulation steps:{gradient_accumulation_steps} | Total effect
 block_size = 1024 # Defined by project specs, DO NOT CHANGE
 
 # max_iters = 600000 # total number of training iterations
-max_iters = 10000 # total number of training iterations
+max_iters = 20000 # total number of training iterations
 # max_iters = 1500 # total number of training iterations
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 
@@ -221,7 +221,7 @@ else:
     raise ValueError("Unknown input for --type")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # wrap model into DDP container
 if ddp:

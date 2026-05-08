@@ -76,23 +76,20 @@ class SparseMoE(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        
+
         # 1. Get routing probabilities
         router_logits = self.router(x)
         routing_probs = F.softmax(router_logits, dim=-1)
 
         # --- Aux Loss Calculation ---
-        # Mean routing probability per expert
-        mean_probs = routing_probs.mean(dim=(0, 1)) 
-        
-        # 2. Select Top-K experts
+        mean_probs = routing_probs.mean(dim=(0, 1))
         top_k_weights, top_k_indices = torch.topk(routing_probs, self.top_k, dim=-1)
-        
-        # Fraction of tokens routed to each expert
-        flat_indices = top_k_indices.view(-1)
-        counts = torch.bincount(flat_indices, minlength=self.num_experts).to(x.dtype)
+
+        # Fraction of tokens routed to each expert (flattened to 1D for bincount)
+        flat_indices_1d = top_k_indices.view(-1)
+        counts = torch.bincount(flat_indices_1d, minlength=self.num_experts).to(x.dtype)
         route_frac = counts / (B * T * self.top_k)
-        
+
         # Load balancing loss
         aux_loss = self.num_experts * torch.sum(mean_probs * route_frac)
         # ----------------------------
@@ -100,20 +97,27 @@ class SparseMoE(nn.Module):
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True) # Normalize
 
         # 3. Route tokens
-        flat_x = x.view(-1, C)
-        flat_weights = top_k_weights.view(-1, self.top_k)
-        flat_output = torch.zeros_like(flat_x)
+        flat_x = x.view(-1, C) # [B*T, C]
+        flat_indices = top_k_indices.view(-1, self.top_k) # [B*T, top_k]
+        flat_weights = top_k_weights.view(-1, self.top_k) # [B*T, top_k]
+        flat_output = torch.zeros_like(flat_x) # [B*T, C]
 
         for i, expert in enumerate(self.experts):
+            # Mask of shape [B*T, top_k]
             expert_mask = (flat_indices == i)
-            if expert_mask.any():
-                token_indices = expert_mask.any(dim=-1)
-                expert_inputs = flat_x[token_indices]
+
+            # Mask of shape [B*T] indicating if token goes to expert 'i'
+            token_mask = expert_mask.any(dim=-1)
+
+            if token_mask.any():
+                expert_inputs = flat_x[token_mask]
                 expert_outputs = expert(expert_inputs)
 
-                # Apply weights
-                weights = flat_weights[token_indices][expert_mask[token_indices]].unsqueeze(-1)
-                flat_output[token_indices] += expert_outputs * weights
+                # Extract routing weights for this expert and sum over top_k dimension
+                weights = (flat_weights[token_mask] * expert_mask[token_mask].float()).sum(dim=-1, keepdim=True)
+
+                # Apply weights and accumulate
+                flat_output[token_mask] += expert_outputs * weights
 
         return flat_output.view(B, T, C), aux_loss
 

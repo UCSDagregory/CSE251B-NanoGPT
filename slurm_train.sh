@@ -85,9 +85,8 @@ echo "Starting training smoke test..."
 if timeout 12h python train.py \
   --device cuda \
   --type scratch \
-  --folder start_dist \
-  --data_fd_name data/mixed-data \
-  --chpn TEST
+  --folder my_model \
+  --data_fd_name data/mixed-data
 then
     echo "Training finished before timeout."
 else
