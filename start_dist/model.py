@@ -1,12 +1,9 @@
 import torch
 import torch.nn as nn
 import os
-import inspect
 from torch.nn import functional as F
 from typing import Any
 import math
-from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
-
 
 MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
@@ -61,7 +58,6 @@ class nanoGPT(nn.Module):
     #     self.opt_weight_decay = 0
     #     self.opt_learning_rate = 0
     #     self.opt_betas = 0
-    #     self.opt_device_type = 0
     #     self.opt_type = "muon"
 
     def __init__(
@@ -143,7 +139,6 @@ class nanoGPT(nn.Module):
         self.opt_weight_decay = 0
         self.opt_learning_rate = 0
         self.opt_betas = 0
-        self.opt_device_type = 0
         self.opt_type = "muon"
 
     def _init_weights(self, module):
@@ -234,7 +229,8 @@ class nanoGPT(nn.Module):
                 "learning_rate":self.opt_learning_rate,
                 "betas":self.opt_betas,
                 "optimizer":self.opt_type,
-                "device_type":self.opt_device_type,
+                "backoff_thresh":self.backoff_thresh,
+                "backoff_rates":self.backoff_rates
             },
             MODEL_STATE_DICT: self.state_dict(),
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
@@ -260,16 +256,20 @@ class nanoGPT(nn.Module):
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         torch.save(checkpoint, full_checkpoint_path)
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, optimizer_type, device_type):
+    def configure_optimizers(self, args):
+        print(args)
+        weight_decay, learning_rate, betas, optimizer_type, bkoff_thresh, bkoff_rates, device_type = args
         self.opt_weight_decay = weight_decay
         self.opt_learning_rate = learning_rate
         self.opt_betas = betas
         self.opt_type = optimizer_type
-        self.opt_device_type = device_type
+        self.backoff_thresh = bkoff_thresh
+        self.backoff_rates = bkoff_rates
 
         # gather trainable params once
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
+        param_groups = None
         if optimizer_type == "muon":
             print("Using muon optimizer")
 
@@ -338,21 +338,6 @@ class nanoGPT(nn.Module):
                 ),
             ]
 
-            use_distributed_muon = (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-                and torch.distributed.get_world_size() > 1
-            )
-
-            if use_distributed_muon:
-                print("Using distributed MuonWithAuxAdam")
-                optimizer = MuonWithAuxAdam(param_groups)
-            else:
-                print("Using SingleDeviceMuonWithAuxAdam")
-                optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
-
-            return optimizer
-
         if optimizer_type == "adam":
             # default AdamW path
             decay_params = []
@@ -369,7 +354,7 @@ class nanoGPT(nn.Module):
                 else:
                     nodecay_params.append(p)
 
-            optim_groups = [
+            param_groups = [
                 {"params": decay_params, "weight_decay": weight_decay},
                 {"params": nodecay_params, "weight_decay": 0.0},
             ]
@@ -379,21 +364,14 @@ class nanoGPT(nn.Module):
             print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
             print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
-            fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
-            use_fused = fused_available and device_type == "cuda"
-            extra_args = dict(fused=True) if use_fused else dict()
+            param_groups.append(learning_rate)
+            param_groups.append(betas)
 
-            optimizer = torch.optim.AdamW(
-                optim_groups,
-                lr=learning_rate,
-                betas=betas,
-                **extra_args,
-            )
-            print(f"using fused AdamW: {use_fused}")
+        if (param_groups is None):
+            raise ValueError(f"Invalid optimizer type: {optimizer_type}")
 
-            return optimizer
+        return [param_groups, optimizer_type, device_type]
         
-        raise ValueError(f"Invalid optimizer type: {optimizer_type}")
 
 def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A", resume=False):
     model_args = [model_folder_name, chkpt_folder_name]
