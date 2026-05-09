@@ -135,7 +135,7 @@ effective_batch_size = 96
 
 batch_size = 48 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-# batch_size = 2 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -265,41 +265,53 @@ def estimate_loss():
     return out
 
 def get_lr(it):
-    if OPT_TYPE == "adam":
-        base_lr = LEARNING_RATE
+    if (OPT_TYPE == 'adam'):
+        raise ValueError("Scheduler not yet setup for ADAM")
+    if (it < warmup_iters):
+        new_lr = []
+        for lr in LEARNING_RATE:
+            warmup_lr = (max(1.0, float(it)) / float(warmup_iters)) * lr
+            new_lr.append(warmup_lr)
+        return new_lr
     else:
-        hidden_base_lr, nonhidden_base_lr = LEARNING_RATE
+        return LEARNING_RATE
 
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        warmup_scale = (it + 1) / (warmup_iters + 1)
+# def get_lr(it):
+#     if OPT_TYPE == "adam":
+#         base_lr = LEARNING_RATE
+#     else:
+#         hidden_base_lr, nonhidden_base_lr = LEARNING_RATE
 
-        if OPT_TYPE == "adam":
-            return base_lr * warmup_scale
+#     # 1) linear warmup for warmup_iters steps
+#     if it < warmup_iters:
+#         warmup_scale = (it + 1) / (warmup_iters + 1)
 
-        return [
-            hidden_base_lr * warmup_scale,
-            nonhidden_base_lr * warmup_scale,
-        ]
+#         if OPT_TYPE == "adam":
+#             return base_lr * warmup_scale
 
-    # 2) if past decay horizon, clamp at min lr
-    if it > lr_decay_iters:
-        if OPT_TYPE == "adam":
-            return min_lr
+#         return [
+#             hidden_base_lr * warmup_scale,
+#             nonhidden_base_lr * warmup_scale,
+#         ]
 
-        return [min_lr, min_lr]
+#     # 2) if past decay horizon, clamp at min lr
+#     if it > lr_decay_iters:
+#         if OPT_TYPE == "adam":
+#             return min_lr
 
-    # 3) cosine decay from base lr down to min lr
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+#         return [min_lr, min_lr]
 
-    if OPT_TYPE == "adam":
-        return min_lr + coeff * (base_lr - min_lr)
+#     # 3) cosine decay from base lr down to min lr
+#     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+#     assert 0 <= decay_ratio <= 1
+#     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
 
-    hidden_lr = min_lr + coeff * (hidden_base_lr - min_lr)
-    nonhidden_lr = min_lr + coeff * (nonhidden_base_lr - min_lr)
-    return [hidden_lr, nonhidden_lr]
+#     if OPT_TYPE == "adam":
+#         return min_lr + coeff * (base_lr - min_lr)
+
+#     hidden_lr = min_lr + coeff * (hidden_base_lr - min_lr)
+#     nonhidden_lr = min_lr + coeff * (nonhidden_base_lr - min_lr)
+#     return [hidden_lr, nonhidden_lr]
 
 # training loop
 X, Y = batch_helper.get_batch('train') # fetch the very first batch
@@ -433,6 +445,7 @@ while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
+    print(f"Current learning rates: {lr}")
 
     if OPT_TYPE == "adam":
         for param_group in optimizer.param_groups:
