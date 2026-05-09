@@ -17,6 +17,7 @@ cleanup_jobs() {
   echo "$pids" | xargs -r kill -9
   echo "Killed background jobs:"
   echo "$pids"
+  rm -rf .././.scratch
 }
 
 cleanup_jobs

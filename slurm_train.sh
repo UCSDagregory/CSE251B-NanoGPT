@@ -1,10 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$SCRIPT_DIR"
 
-mkdir -p logs
+cd "$REPO"
+
+mkdir -p "$REPO/logs"
 
 echo "Job ID: ${SLURM_JOB_ID:-manual}"
 echo "Node: $(hostname)"
@@ -21,10 +23,22 @@ nvidia-smi
 echo "Torch CUDA:"
 python -c "import torch; print('torch:', torch.__version__); print('cuda available:', torch.cuda.is_available())"
 
-if [ -f ~/.hf_token_env ]; then
-    source ~/.hf_token_env
+# Prefer a repo-local token file, but allow HF_TOKEN to already be exported.
+HF_TOKEN_ENV_FILE="${HF_TOKEN_ENV_FILE:-$REPO/.hf_token_env}"
+
+if [ -f "$HF_TOKEN_ENV_FILE" ]; then
+    source "$HF_TOKEN_ENV_FILE"
+elif [ -n "${HF_TOKEN:-}" ]; then
+    echo "HF_TOKEN already set in environment."
 else
-    echo "ERROR: ~/.hf_token_env not found."
+    echo "ERROR: Hugging Face token not found."
+    echo "Expected either:"
+    echo "  1. HF_TOKEN already exported in the environment, or"
+    echo "  2. Token file at: $HF_TOKEN_ENV_FILE"
+    echo
+    echo "Create it with:"
+    echo "  echo 'export HF_TOKEN=hf_your_token_here' > \"$REPO/.hf_token_env\""
+    echo "  chmod 600 \"$REPO/.hf_token_env\""
     exit 1
 fi
 
@@ -52,9 +66,9 @@ python -m pip install --user --no-cache-dir --upgrade pip setuptools wheel
 
 # Install project requirements if present.
 # Pip will print "Requirement already satisfied" for packages already available.
-if [ -f requirements.txt ]; then
-    echo "Installing project requirements from requirements.txt..."
-    python -m pip install --user --no-cache-dir -r requirements.txt
+if [ -f "$REPO/requirements.txt" ]; then
+    echo "Installing project requirements from $REPO/requirements.txt..."
+    python -m pip install --user --no-cache-dir -r "$REPO/requirements.txt"
 else
     echo "No requirements.txt found; installing known runtime dependencies explicitly..."
 fi
@@ -78,22 +92,22 @@ python -c "import torch; print('torch ok:', torch.__version__, 'cuda:', torch.cu
 python -c "import os; print('HF_TOKEN set:', bool(os.environ.get('HF_TOKEN')))"
 
 echo "Repo contents:"
-ls
+ls "$REPO"
 
 echo "Starting training smoke test..."
 
-if timeout 12h python train.py \
+if timeout 12h python "$REPO/train.py" \
   --device cuda \
   --type scratch \
   --folder start_dist \
-  --data_fd_name data/mixed-data \
+  --data_fd_name "$REPO/data/mixed-data" \
   --chpn TEST
 then
     echo "Training finished before timeout."
 else
     code=$?
     if [ "$code" -eq 124 ]; then
-        echo "Training finished sucessfully."
+        echo "Training finished successfully."
     else
         echo "Training failed with exit code $code."
         exit "$code"

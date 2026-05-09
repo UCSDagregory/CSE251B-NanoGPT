@@ -3,7 +3,9 @@ set -euo pipefail
 
 HF_REVISION="${1:-main}"
 
-REPO="$HOME/CSE251B-NanoGPT"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$SCRIPT_DIR"
+
 SCRATCH_BASE="/scratch/$USER"
 DATASET_NAME="mixed-data"
 SAFE_REVISION="${HF_REVISION//\//__}"
