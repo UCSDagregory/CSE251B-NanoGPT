@@ -365,7 +365,7 @@ while True:
             # We're in a good regime and we should scale up
             else:
                 for idx in range(len(lr_scalars)):
-                    lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*backoff_rates[idx]) + lr_scalars[idx])
+                    lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*(1.0-backoff_rates[idx])) + lr_scalars[idx])
 
 
 
