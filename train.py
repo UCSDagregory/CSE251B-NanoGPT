@@ -33,8 +33,6 @@ import argparse
 
 import json
 import re
-from pathlib import Path
-import shutil
 
 
 TRAIN_HELPER_FILENAME = "train_helper.py"
@@ -140,7 +138,7 @@ effective_batch_size = 96
 
 batch_size = 48 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-# batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -156,8 +154,8 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 # warmup_iters = 200 # how many steps to warm up for
-# warmup_iters = 25 # how many steps to warm up for
-warmup_iters = max(25,int(0.05*float(max_iters))) # how many steps to warm up for
+warmup_iters = 10 # how many steps to warm up for
+# warmup_iters = max(25,int(0.05*float(max_iters))) # how many steps to warm up for
 lr_decay_iters = int(max_iters*1.0) # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
@@ -234,6 +232,9 @@ elif init_from == 'resume':
     checkpoint_file_path = args.chpr
     print(f"Resuming from a checkpoint:{checkpoint_file_path}")
     model, model_sd, opt_args, opt_sd, iter_num = train_helper.CreateModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
+    if (not args.opt_name is None):
+        print("Using new optimizer args instead of those defined in the checkpoint.")
+        opt_args = parsed_opt_args
     backoff_threshold, backoff_rates = opt_args[-2:]
     opt_args.append(device_type)
     max_iters += iter_num
@@ -285,7 +286,7 @@ def get_lr(it, val_losses=None):
             new_lr.append(warmup_lr)
         return new_lr
     else:
-        return LEARNING_RATE
+        return LEARNING_RATE.copy()
 
 # training loop
 X, Y = batch_helper.get_batch('train') # fetch the very first batch
@@ -302,9 +303,8 @@ losses = {}
 losses['val'] = 999.0
 print(f"Warmup iters for:{warmup_iters}\n")
 
-MAX_SCALAR = 5.0
+MAX_SCALAR = 2.0
 k_gradients = 4
-val_replacement_ptr = 0
 validation_losses = []
 lr_scalars = []
 for _ in LEARNING_RATE:
@@ -349,24 +349,28 @@ while True:
         if (len(validation_losses) > k_gradients):
             validation_losses.pop(0)
 
-        if (len(validation_losses > k_gradients)):
+        if (len(validation_losses) > k_gradients):
             raise ValueError("Somethings wrong when managing the running validation losses list. Size of list is > k, should be = k")
         
         if (len(validation_losses) == k_gradients and iter_num >= warmup_iters):
             pairwise_gradient_avg = 0.0
             for idx in range(1, len(validation_losses)):
-                pairwise_gradient_avg += validation_losses[idx] / validation_losses[idx-1]
-            pairwise_gradient_avg = abs((pairwise_gradient_avg-1.0) / len(validation_losses))
+                pairwise_gradient_avg += (validation_losses[idx] / validation_losses[idx-1])-1.0
+            # pairwise_gradient_avg = abs((pairwise_gradient_avg) / len(validation_losses))
+            pairwise_gradient_avg = (pairwise_gradient_avg) / len(validation_losses)
             print(f"Avg gradient for loss of past {k_gradients} validation losses: {pairwise_gradient_avg:0.3f}")
             # If it's below the threshold we need to try a lower LR
-            if (pairwise_gradient_avg <= backoff_threshold):
+            if (pairwise_gradient_avg <= backoff_threshold and pairwise_gradient_avg >= -1.0*backoff_threshold):
                 for idx in range(len(lr_scalars)):
                     lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
+                validation_losses = []
+            
             # We're in a good regime and we should scale up
-            else:
+            if (pairwise_gradient_avg < -1.0*backoff_threshold):
                 for idx in range(len(lr_scalars)):
                     lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*(1.0-backoff_rates[idx])) + lr_scalars[idx])
-
+                validation_losses = []
+            # Remove the previous values to give the new change time to take affect
 
 
         print(
