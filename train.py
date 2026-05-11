@@ -379,43 +379,43 @@ while True:
             f"val loss {losses['val']:.4f}"
         )
 
-        if losses["val"] < best_val_loss:
-            best_val_loss = losses["val"]
+        # if losses["val"] < best_val_loss:
+        #     best_val_loss = losses["val"]
 
-            print(f"Current val loss: {losses['val']:.4f}")
+        print(f"Current val loss: {losses['val']:.4f}")
 
-            current_checkpoints = len(os.listdir(model_checkpoint_path))
+        current_checkpoints = len(os.listdir(model_checkpoint_path))
 
-            if current_checkpoints >= max_checkpoints_to_keep:
-                def _checkpoint_iter_num(filename):
-                    match = re.search(r"ITER0*(\d+)", filename)
-                    if match is None:
-                        raise ValueError(
-                            f"Could not parse iteration number from checkpoint filename: {filename}"
-                        )
-                    return int(match.group(1))
+        if current_checkpoints >= max_checkpoints_to_keep:
+            def _checkpoint_iter_num(filename):
+                match = re.search(r"ITER0*(\d+)", filename)
+                if match is None:
+                    raise ValueError(
+                        f"Could not parse iteration number from checkpoint filename: {filename}"
+                    )
+                return int(match.group(1))
 
-                files = [
-                    f for f in os.listdir(model_checkpoint_path)
-                    if os.path.isfile(os.path.join(model_checkpoint_path, f))
-                ]
+            files = [
+                f for f in os.listdir(model_checkpoint_path)
+                if os.path.isfile(os.path.join(model_checkpoint_path, f))
+            ]
 
-                chkpt_to_remove = os.path.join(
-                    model_checkpoint_path,
-                    min(files, key=_checkpoint_iter_num),
-                )
+            chkpt_to_remove = os.path.join(
+                model_checkpoint_path,
+                min(files, key=_checkpoint_iter_num),
+            )
 
-                print(f"Removing checkpoint: {chkpt_to_remove}")
-                os.remove(chkpt_to_remove)
+            print(f"Removing checkpoint: {chkpt_to_remove}")
+            os.remove(chkpt_to_remove)
 
-            model.saveCheckpoint(optimizer, losses["val"], iter_num)
+        model.saveCheckpoint(optimizer, losses["val"], iter_num)
 
-            with open(os.path.join(model_path, "training_data.txt"), mode="a") as f:
-                f.write(
-                    f"{total_tokens_processed},"
-                    f"{iter_num},"
-                    f"{losses['val']:.4f}\n"
-                )
+        with open(os.path.join(model_path, "training_data.txt"), mode="a") as f:
+            f.write(
+                f"{total_tokens_processed},"
+                f"{iter_num},"
+                f"{losses['val']:.4f}\n"
+            )
 
     if iter_num == 0 and eval_only:
         break
