@@ -92,8 +92,10 @@ train_helper.registerCreateModel(impl_module.CreateModel)
 train_helper.registerCreateOptimizer(impl_module.CreateOptimizer)
 
 arg_opt_path = args.opt_name
+overwrite_optimizer = True
 if (arg_opt_path is None):
     arg_opt_path = OPT_FILENAME
+    overwrite_optimizer = False
 opt_path = os.path.join(model_path, arg_opt_path)
 parsed_opt_args = parseOptParams(opt_path)
 
@@ -232,7 +234,7 @@ elif init_from == 'resume':
     checkpoint_file_path = args.chpr
     print(f"Resuming from a checkpoint:{checkpoint_file_path}")
     model, model_sd, opt_args, opt_sd, iter_num = train_helper.CreateModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
-    if (not args.opt_name is None):
+    if (overwrite_optimizer):
         print("Using new optimizer args instead of those defined in the checkpoint.")
         opt_args = parsed_opt_args
     backoff_threshold, backoff_rates = opt_args[-2:]
@@ -242,7 +244,8 @@ elif init_from == 'resume':
     model.to(device)
     formatted_opt_args = model.configure_optimizers(opt_args)
     optimizer = train_helper.CreateOptimizer(formatted_opt_args)
-    optimizer.load_state_dict(opt_sd)
+    if (not overwrite_optimizer):
+        optimizer.load_state_dict(opt_sd)
 
 else:
     raise ValueError("Unknown input for --type")
@@ -303,313 +306,29 @@ losses = {}
 losses['val'] = 999.0
 print(f"Warmup iters for:{warmup_iters}\n")
 
-# MAX_SCALAR = 2.0
-# k_gradients = 4
-# validation_losses = []
-# lr_scalars = []
-# for _ in LEARNING_RATE:
-#     lr_scalars.append(1.0)
+MAX_SCALAR = 1.5
+k_gradients = 4
+validation_losses = []
+lr_scalars = []
+for _ in LEARNING_RATE:
+    lr_scalars.append(1.0)
 
-# while True:
-#     total_tokens_processed = iter_num * effective_batch_size * block_size
-#     print(f"Tokens processed:{total_tokens_processed} | {total_tokens_processed:.2e}\n")
-
-#     # determine and set the learning rate for this iteration
-#     lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
-#     for idx in range(len(lr)):
-#         lr[idx] *= lr_scalars[idx]
-#     print(f"Current learning rates: {lr} | Current learning rate scalars: {lr_scalars}")
-
-#     if OPT_TYPE == "adam":
-#         for param_group in optimizer.param_groups:
-#             param_group["lr"] = lr
-
-#     elif OPT_TYPE == "muon":
-#         hidden_lr, nonhidden_lr = lr
-
-#         for param_group in optimizer.param_groups:
-#             param_group["lr"] = (
-#                 hidden_lr if param_group.get("use_muon", False)
-#                 else nonhidden_lr
-#             )
-
-#     else:
-#         raise ValueError(
-#             "Invalid optimizer type. Adam expects scalar lr; Muon expects "
-#             "(hidden_lr, nonhidden_lr)."
-#         )
-
-#     # evaluate the loss on train/val sets
-#     losses = None
-
-#     if iter_num % eval_interval == 0 and master_process:
-#         losses = estimate_loss()
-
-#         validation_losses.append(losses['val'])
-#         if (len(validation_losses) > k_gradients):
-#             validation_losses.pop(0)
-
-#         if (len(validation_losses) > k_gradients):
-#             raise ValueError("Somethings wrong when managing the running validation losses list. Size of list is > k, should be = k")
-        
-#         if (len(validation_losses) == k_gradients and iter_num >= warmup_iters):
-#             pairwise_gradient_avg = 0.0
-#             for idx in range(1, len(validation_losses)):
-#                 pairwise_gradient_avg += (validation_losses[idx] / validation_losses[idx-1])-1.0
-#             # pairwise_gradient_avg = abs((pairwise_gradient_avg) / len(validation_losses))
-#             pairwise_gradient_avg = (pairwise_gradient_avg) / len(validation_losses)
-#             print(f"Avg gradient for loss of past {k_gradients} validation losses: {pairwise_gradient_avg:0.3f}")
-#             # If it's below the threshold we need to try a lower LR
-#             if (pairwise_gradient_avg <= backoff_threshold and pairwise_gradient_avg >= -1.0*backoff_threshold):
-#                 for idx in range(len(lr_scalars)):
-#                     lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
-#                 validation_losses = []
-            
-#             # We're in a good regime and we should scale up
-#             if (pairwise_gradient_avg < -1.0*backoff_threshold):
-#                 for idx in range(len(lr_scalars)):
-#                     lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*(1.0-backoff_rates[idx])) + lr_scalars[idx])
-#                 validation_losses = []
-#             # Remove the previous values to give the new change time to take affect
-
-
-#         print(
-#             f"step {iter_num}: "
-#             f"train loss {losses['train']:.4f}, "
-#             f"val loss {losses['val']:.4f}"
-#         )
-
-#         # if losses["val"] < best_val_loss:
-#         #     best_val_loss = losses["val"]
-
-#         print(f"Current val loss: {losses['val']:.4f}")
-
-#         current_checkpoints = len(os.listdir(model_checkpoint_path))
-
-#         if current_checkpoints >= max_checkpoints_to_keep:
-#             def _checkpoint_iter_num(filename):
-#                 match = re.search(r"ITER0*(\d+)", filename)
-#                 if match is None:
-#                     raise ValueError(
-#                         f"Could not parse iteration number from checkpoint filename: {filename}"
-#                     )
-#                 return int(match.group(1))
-
-#             files = [
-#                 f for f in os.listdir(model_checkpoint_path)
-#                 if os.path.isfile(os.path.join(model_checkpoint_path, f))
-#             ]
-
-#             chkpt_to_remove = os.path.join(
-#                 model_checkpoint_path,
-#                 min(files, key=_checkpoint_iter_num),
-#             )
-
-#             print(f"Removing checkpoint: {chkpt_to_remove}")
-#             os.remove(chkpt_to_remove)
-
-#         model.saveCheckpoint(optimizer, losses["val"], iter_num)
-
-#         with open(os.path.join(model_path, "training_data.txt"), mode="a") as f:
-#             f.write(
-#                 f"{total_tokens_processed},"
-#                 f"{iter_num},"
-#                 f"{losses['val']:.4f}\n"
-#             )
-
-#     if iter_num == 0 and eval_only:
-#         break
-
-#     # forward/backward update with gradient accumulation
-#     for micro_step in range(gradient_accumulation_steps):
-#         print(f"Microstep:{micro_step}\n")
-
-#         if ddp:
-#             model.require_backward_grad_sync = (
-#                 micro_step == gradient_accumulation_steps - 1
-#             )
-
-#         with ctx:
-#             logits, loss = model(X, Y)
-#             loss = loss / gradient_accumulation_steps
-
-#         X, Y = batch_helper.get_batch("train")
-
-#         scaler.scale(loss).backward()
-
-#     # clip gradients
-#     if grad_clip != 0.0:
-#         scaler.unscale_(optimizer)
-#         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-#     # optimizer step
-#     scaler.step(optimizer)
-#     scaler.update()
-#     optimizer.zero_grad(set_to_none=True)
-
-#     # timing and logging
-#     t1 = time.time()
-#     dt = t1 - t0
-#     t0 = t1
-
-#     lossf = loss.item() * gradient_accumulation_steps
-
-#     if iter_num % log_interval == 0 and master_process:
-#         if local_iter_num >= 5:
-#             mfu = raw_model.estimate_mfu(
-#                 batch_size * gradient_accumulation_steps,
-#                 dt,
-#             )
-#             running_mfu = (
-#                 mfu if running_mfu == -1.0
-#                 else 0.9 * running_mfu + 0.1 * mfu
-#             )
-
-#         print(
-#             f"iter {iter_num}: "
-#             f"loss {lossf:.4f}, "
-#             f"time {dt * 1000:.2f}ms, "
-#             f"mfu {running_mfu * 100:.2f}%"
-#         )
-
-#     # periodic checkpoint based on latest train loss
-#     if (
-#         iter_num % iters_per_checkpoint == 0
-#         and iter_num > 0
-#         and master_process
-#     ):
-#         if (iter_num%eval_interval == 0 or iters_per_checkpoint <= 0):
-#             continue
-
-#         current_checkpoints = len(os.listdir(model_checkpoint_path))
-
-#         if current_checkpoints >= max_checkpoints_to_keep:
-#             def _checkpoint_iter_num(filename):
-#                 match = re.search(r"ITER0*(\d+)", filename)
-#                 if match is None:
-#                     raise ValueError(
-#                         f"Could not parse iteration number from checkpoint filename: {filename}"
-#                     )
-#                 return int(match.group(1))
-
-#             files = [
-#                 f for f in os.listdir(model_checkpoint_path)
-#                 if os.path.isfile(os.path.join(model_checkpoint_path, f))
-#             ]
-
-#             chkpt_to_remove = os.path.join(
-#                 model_checkpoint_path,
-#                 min(files, key=_checkpoint_iter_num),
-#             )
-
-#             print(f"Removing checkpoint: {chkpt_to_remove}")
-#             os.remove(chkpt_to_remove)
-
-#         model.saveCheckpoint(optimizer, lossf, iter_num)
-
-#     iter_num += 1
-#     local_iter_num += 1
-
-#     if iter_num > max_iters:
-#         break
-
-# if ddp:
-#     destroy_process_group()
-
-# ------------------------------------------------------------
-# Adaptive LR backoff setup
-# ------------------------------------------------------------
-# For Muon:
-#   lr_scalars[0] applies to hidden/Muon LR
-#   lr_scalars[1] applies to nonhidden/Adam-path LR
-#
-# For Adam:
-#   use lr_scalars = [1.0]
-#
-# backoff_threshold is interpreted as "min_delta" in val loss.
-# Example: 0.003 means val loss must improve by at least 0.003 nats
-# to reset patience.
-#
-# backoff_rates is a list of multiplicative backoff factors.
-# Example for Muon: [0.7, 0.7]
-# Example gentler nonhidden decay: [0.7, 0.8]
-
-if OPT_TYPE == "muon":
-    lr_scalars = [1.0, 1.0]
-elif OPT_TYPE == "adam":
-    lr_scalars = [1.0]
-else:
-    raise ValueError("Invalid OPT_TYPE")
-
-best_adaptive_val_loss = float("inf")
-bad_val_evals = 0
-
-adaptive_patience = 5
-adaptive_min_scalar = 0.10
-adaptive_start_iter = warmup_iters
-
-# You should define these in config:
-# backoff_threshold = 0.003
-# backoff_rates = [0.7, 0.7]  # Muon
-# backoff_rates = [0.7]       # Adam
-
-if len(backoff_rates) != len(lr_scalars):
-    raise ValueError(
-        f"backoff_rates length {len(backoff_rates)} must match "
-        f"lr_scalars length {len(lr_scalars)}"
-    )
-
-
-# ------------------------------------------------------------
-# Training loop
-# ------------------------------------------------------------
 while True:
     total_tokens_processed = iter_num * effective_batch_size * block_size
+    print(f"Tokens processed:{total_tokens_processed} | {total_tokens_processed:.2e}\n")
 
-    if master_process:
-        print(
-            f"Tokens processed: {total_tokens_processed} | "
-            f"{total_tokens_processed:.2e}\n"
-        )
-
-    # ------------------------------------------------------------
-    # Determine base LR and apply adaptive scalars.
-    # ------------------------------------------------------------
-    base_lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
-
-    # Make copy if list/tuple.
-    if isinstance(base_lr, (tuple, list)):
-        lr = list(base_lr)
-    else:
-        lr = base_lr
+    # determine and set the learning rate for this iteration
+    lr = get_lr(iter_num) if decay_lr else LEARNING_RATE
+    for idx in range(len(lr)):
+        lr[idx] *= lr_scalars[idx]
+    print(f"Current learning rates: {lr} | Current learning rate scalars: {lr_scalars}")
 
     if OPT_TYPE == "adam":
-        if isinstance(lr, list):
-            raise ValueError("Adam expects scalar lr, but got list/tuple.")
-
-        if len(lr_scalars) != 1:
-            raise ValueError("Adam expects lr_scalars length 1.")
-
-        scaled_lr = lr * lr_scalars[0]
-
         for param_group in optimizer.param_groups:
-            param_group["lr"] = scaled_lr
-
-        if master_process:
-            print(
-                f"Current learning rate: {scaled_lr:.8g} | "
-                f"scalar: {lr_scalars[0]:.6g}"
-            )
+            param_group["lr"] = lr
 
     elif OPT_TYPE == "muon":
-        if not isinstance(lr, list) or len(lr) != 2:
-            raise ValueError("Muon expects lr = [hidden_lr, nonhidden_lr].")
-
-        if len(lr_scalars) != 2:
-            raise ValueError("Muon expects lr_scalars length 2.")
-
-        hidden_lr = lr[0] * lr_scalars[0]
-        nonhidden_lr = lr[1] * lr_scalars[1]
+        hidden_lr, nonhidden_lr = lr
 
         for param_group in optimizer.param_groups:
             param_group["lr"] = (
@@ -617,96 +336,57 @@ while True:
                 else nonhidden_lr
             )
 
-        if master_process:
-            print(
-                f"Current learning rates: "
-                f"[hidden={hidden_lr:.8g}, nonhidden={nonhidden_lr:.8g}] | "
-                f"scalars: {lr_scalars}"
-            )
-
     else:
         raise ValueError(
-            "Invalid optimizer type. Adam expects scalar lr; "
-            "Muon expects [hidden_lr, nonhidden_lr]."
+            "Invalid optimizer type. Adam expects scalar lr; Muon expects "
+            "(hidden_lr, nonhidden_lr)."
         )
 
-    # ------------------------------------------------------------
-    # Evaluation + adaptive LR backoff.
-    # ------------------------------------------------------------
+    # evaluate the loss on train/val sets
     losses = None
 
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        val_loss = losses["val"]
+
+        validation_losses.append(losses['val'])
+        if (len(validation_losses) > k_gradients):
+            validation_losses.pop(0)
+
+        if (len(validation_losses) > k_gradients):
+            raise ValueError("Somethings wrong when managing the running validation losses list. Size of list is > k, should be = k")
+        
+        if (len(validation_losses) == k_gradients and iter_num >= warmup_iters):
+            pairwise_gradient_avg = 0.0
+            for idx in range(1, len(validation_losses)):
+                pairwise_gradient_avg += (validation_losses[idx] / validation_losses[idx-1])-1.0
+            # pairwise_gradient_avg = abs((pairwise_gradient_avg) / len(validation_losses))
+            pairwise_gradient_avg = (pairwise_gradient_avg) / len(validation_losses)-1.0 # -1 for unbiased estimator
+            print(f"Avg gradient for loss of past {k_gradients} validation losses: {pairwise_gradient_avg:0.3f}")
+            # If it's below the threshold we need to try a lower LR
+            # if (pairwise_gradient_avg <= backoff_threshold and pairwise_gradient_avg >= -1.0*backoff_threshold):
+            #     for idx in range(len(lr_scalars)):
+            #         lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
+            #     validation_losses = []
+            
+            # We're in a good regime and we should scale up
+            # if (pairwise_gradient_avg < -1.0*backoff_threshold):
+            #     for idx in range(len(lr_scalars)):
+            #         lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*(1.0-backoff_rates[idx])) + lr_scalars[idx])
+            #     validation_losses = []
+            # Remove the previous values to give the new change time to take affect
+
 
         print(
             f"step {iter_num}: "
             f"train loss {losses['train']:.4f}, "
-            f"val loss {val_loss:.4f}"
+            f"val loss {losses['val']:.4f}"
         )
 
-        print(f"Current val loss: {val_loss:.4f}")
+        # if losses["val"] < best_val_loss:
+        #     best_val_loss = losses["val"]
 
-        # --------------------------------------------------------
-        # One-way adaptive LR backoff.
-        #
-        # Important:
-        #   - Never scales LR up.
-        #   - Only reduces LR after validation stops improving.
-        #   - Uses best-val + patience instead of noisy pairwise ratios.
-        # --------------------------------------------------------
-        if iter_num >= adaptive_start_iter:
-            meaningful_improvement = (
-                val_loss < best_adaptive_val_loss - backoff_threshold
-            )
+        print(f"Current val loss: {losses['val']:.4f}")
 
-            if meaningful_improvement:
-                best_adaptive_val_loss = val_loss
-                bad_val_evals = 0
-
-                print(
-                    f"Adaptive LR: new best val "
-                    f"{best_adaptive_val_loss:.4f}; "
-                    f"bad_val_evals reset to 0"
-                )
-
-            else:
-                bad_val_evals += 1
-
-                print(
-                    f"Adaptive LR: no meaningful improvement "
-                    f"({bad_val_evals}/{adaptive_patience}); "
-                    f"best={best_adaptive_val_loss:.4f}, "
-                    f"current={val_loss:.4f}, "
-                    f"required_delta={backoff_threshold:.6f}"
-                )
-
-                if bad_val_evals >= adaptive_patience:
-                    if len(backoff_rates) != len(lr_scalars):
-                        raise ValueError(
-                            f"backoff_rates length {len(backoff_rates)} "
-                            f"must match lr_scalars length {len(lr_scalars)}"
-                        )
-
-                    old_scalars = list(lr_scalars)
-
-                    for i in range(len(lr_scalars)):
-                        lr_scalars[i] = max(
-                            adaptive_min_scalar,
-                            lr_scalars[i] * backoff_rates[i],
-                        )
-
-                    bad_val_evals = 0
-
-                    print(
-                        f"Adaptive LR: plateau detected. "
-                        f"Reducing scalars {old_scalars} -> {lr_scalars} "
-                        f"using backoff_rates={backoff_rates}"
-                    )
-
-        # --------------------------------------------------------
-        # Save eval checkpoint.
-        # --------------------------------------------------------
         current_checkpoints = len(os.listdir(model_checkpoint_path))
 
         if current_checkpoints >= max_checkpoints_to_keep:
@@ -714,8 +394,7 @@ while True:
                 match = re.search(r"ITER0*(\d+)", filename)
                 if match is None:
                     raise ValueError(
-                        f"Could not parse iteration number from checkpoint "
-                        f"filename: {filename}"
+                        f"Could not parse iteration number from checkpoint filename: {filename}"
                     )
                 return int(match.group(1))
 
@@ -732,24 +411,21 @@ while True:
             print(f"Removing checkpoint: {chkpt_to_remove}")
             os.remove(chkpt_to_remove)
 
-        model.saveCheckpoint(optimizer, val_loss, iter_num)
+        model.saveCheckpoint(optimizer, losses["val"], iter_num)
 
         with open(os.path.join(model_path, "training_data.txt"), mode="a") as f:
             f.write(
                 f"{total_tokens_processed},"
                 f"{iter_num},"
-                f"{val_loss:.4f}\n"
+                f"{losses['val']:.4f}\n"
             )
 
     if iter_num == 0 and eval_only:
         break
 
-    # ------------------------------------------------------------
-    # Forward/backward update with gradient accumulation.
-    # ------------------------------------------------------------
+    # forward/backward update with gradient accumulation
     for micro_step in range(gradient_accumulation_steps):
-        if master_process:
-            print(f"Microstep: {micro_step}\n")
+        print(f"Microstep:{micro_step}\n")
 
         if ddp:
             model.require_backward_grad_sync = (
@@ -760,28 +436,21 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps
 
-        # Prefetch next batch while current loss is still live.
         X, Y = batch_helper.get_batch("train")
 
         scaler.scale(loss).backward()
 
-    # ------------------------------------------------------------
-    # Gradient clipping.
-    # ------------------------------------------------------------
+    # clip gradients
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-    # ------------------------------------------------------------
-    # Optimizer step.
-    # ------------------------------------------------------------
+    # optimizer step
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
 
-    # ------------------------------------------------------------
-    # Timing/logging.
-    # ------------------------------------------------------------
+    # timing and logging
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
@@ -806,21 +475,15 @@ while True:
             f"mfu {running_mfu * 100:.2f}%"
         )
 
-    # ------------------------------------------------------------
-    # Periodic non-eval checkpoint.
-    #
-    # Important:
-    #   No `continue` here. Avoid accidentally skipping iter_num += 1.
-    # ------------------------------------------------------------
-    should_save_periodic_checkpoint = (
+    # periodic checkpoint based on latest train loss
+    if (
         iter_num % iters_per_checkpoint == 0
         and iter_num > 0
         and master_process
-        and iters_per_checkpoint > 0
-        and iter_num % eval_interval != 0
-    )
+    ):
+        if (iter_num%eval_interval == 0 or iters_per_checkpoint <= 0):
+            continue
 
-    if should_save_periodic_checkpoint:
         current_checkpoints = len(os.listdir(model_checkpoint_path))
 
         if current_checkpoints >= max_checkpoints_to_keep:
@@ -828,8 +491,7 @@ while True:
                 match = re.search(r"ITER0*(\d+)", filename)
                 if match is None:
                     raise ValueError(
-                        f"Could not parse iteration number from checkpoint "
-                        f"filename: {filename}"
+                        f"Could not parse iteration number from checkpoint filename: {filename}"
                     )
                 return int(match.group(1))
 
@@ -848,9 +510,6 @@ while True:
 
         model.saveCheckpoint(optimizer, lossf, iter_num)
 
-    # ------------------------------------------------------------
-    # Step counters / stop condition.
-    # ------------------------------------------------------------
     iter_num += 1
     local_iter_num += 1
 
