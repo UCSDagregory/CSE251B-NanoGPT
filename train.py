@@ -37,7 +37,7 @@ import json
 TRAIN_HELPER_FILENAME = "train_helper.py"
 OPT_FILENAME = "training_opt_params.json"
 LEARNING_RATE = None
-OPT_TYPE = "muon"
+OPT_TYPE = "adam"
 
 # Example to resume training from a checkpoint
 # python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
