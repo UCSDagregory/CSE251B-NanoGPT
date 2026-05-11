@@ -108,7 +108,7 @@ batch_size = 4                    # micro-batch size -- 99M params on 16GB T4
 block_size = 1024                 # Defined by project specs, DO NOT CHANGE
 
 # training length
-max_iters = 10200                 # ~1B tokens seen (10200 * 98304 = ~1.003B)
+max_iters = 20400                 # ~2B tokens seen (20,400 × 98,304 = ~2.005B tokens)
 grad_clip = 1.0
 
 # learning rate decay settings
