@@ -37,7 +37,7 @@ import json
 TRAIN_HELPER_FILENAME = "train_helper.py"
 OPT_FILENAME = "training_opt_params.json"
 LEARNING_RATE = None
-OPT_TYPE = "adam"
+OPT_TYPE = "muon"
 
 # Example to resume training from a checkpoint
 # python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
@@ -243,34 +243,31 @@ def estimate_loss():
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     if OPT_TYPE == "adam":
-        adam_base_lr = LEARNING_RATE
-    else:
+        base_lr = LEARNING_RATE
+    elif OPT_TYPE == "muon":
         hidden_base_lr, nonhidden_base_lr = LEARNING_RATE
+    else:
+        raise ValueError(f"Unknown optimizer type: {OPT_TYPE}")
 
-    # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
-        warmup_scale = (it + 1) / (warmup_iters + 1)
+        scale = (it + 1) / (warmup_iters + 1)
         if OPT_TYPE == "adam":
-            return adam_base_lr * warmup_scale
-        return [hidden_base_lr * warmup_scale, nonhidden_base_lr * warmup_scale]
+            return base_lr * scale
+        return [hidden_base_lr * scale, nonhidden_base_lr * scale]
 
-    # 2) if it > lr_decay_iters, return min learning rate(s)
     if it > lr_decay_iters:
-        if OPT_TYPE == "adam":
-            return min_lr
-        return [min_lr, min_lr]
+        return min_lr if OPT_TYPE == "adam" else [min_lr, min_lr]
 
-    # 3) in between, use cosine decay down to min learning rate(s)
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
 
     if OPT_TYPE == "adam":
-        return min_lr + coeff * (adam_base_lr - min_lr)
+        return min_lr + coeff * (base_lr - min_lr)
 
-    hidden_lr = min_lr + coeff * (hidden_base_lr - min_lr)
-    nonhidden_lr = min_lr + coeff * (nonhidden_base_lr - min_lr)
-    return [hidden_lr, nonhidden_lr]
+    return [
+        min_lr + coeff * (hidden_base_lr - min_lr),
+        min_lr + coeff * (nonhidden_base_lr - min_lr)
+    ]
 
 # ---------------------------------------------------------------------------
 # Logging setup — CSV files saved in the model folder
