@@ -67,6 +67,7 @@ parser.add_argument("--data_fd_name", required=True) # data_folder_name/folder_n
 parser.add_argument("--chpn", required=False) # folder_name to save checkpoints, only for from scratch init
 parser.add_argument("--chpr", required=False) # folder_name/checkpoint_file_name
 parser.add_argument("--opt_name", required=False)
+parser.add_argument("--reload_opt_state", required=False, default=None)
 parser.add_argument("--data_collection", required=False)
 parser.add_argument("--stream", required=False, default='F') # if T then will use streaming rather than looking for files on disk
 parser.add_argument("--stream_config", required=False, default=None)
@@ -96,6 +97,10 @@ overwrite_optimizer = True
 if (arg_opt_path is None):
     arg_opt_path = OPT_FILENAME
     overwrite_optimizer = False
+
+load_opt_state = False
+if (not args.reload_opt_state is None):
+    load_opt_state = True
 opt_path = os.path.join(model_path, arg_opt_path)
 parsed_opt_args = parseOptParams(opt_path)
 
@@ -244,7 +249,7 @@ elif init_from == 'resume':
     model.to(device)
     formatted_opt_args = model.configure_optimizers(opt_args)
     optimizer = train_helper.CreateOptimizer(formatted_opt_args)
-    if (not overwrite_optimizer):
+    if (load_opt_state):
         optimizer.load_state_dict(opt_sd)
 
 else:
@@ -359,20 +364,20 @@ while True:
             pairwise_gradient_avg = 0.0
             for idx in range(1, len(validation_losses)):
                 pairwise_gradient_avg += (validation_losses[idx] / validation_losses[idx-1])-1.0
-            # pairwise_gradient_avg = abs((pairwise_gradient_avg) / len(validation_losses))
+
             pairwise_gradient_avg = (pairwise_gradient_avg) / len(validation_losses)-1.0 # -1 for unbiased estimator
             print(f"Avg gradient for loss of past {k_gradients} validation losses: {pairwise_gradient_avg:0.3f}")
             # If it's below the threshold we need to try a lower LR
-            # if (pairwise_gradient_avg <= backoff_threshold and pairwise_gradient_avg >= -1.0*backoff_threshold):
-            #     for idx in range(len(lr_scalars)):
-            #         lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
-            #     validation_losses = []
+            if (pairwise_gradient_avg <= backoff_threshold and pairwise_gradient_avg >= -1.0*backoff_threshold):
+                for idx in range(len(lr_scalars)):
+                    lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
+                validation_losses = []
             
             # We're in a good regime and we should scale up
-            # if (pairwise_gradient_avg < -1.0*backoff_threshold):
-            #     for idx in range(len(lr_scalars)):
-            #         lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*(1.0-backoff_rates[idx])) + lr_scalars[idx])
-            #     validation_losses = []
+            if (pairwise_gradient_avg < -1.0*backoff_threshold):
+                for idx in range(len(lr_scalars)):
+                    lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*(1.0-backoff_rates[idx])) + lr_scalars[idx])
+                validation_losses = []
             # Remove the previous values to give the new change time to take affect
 
 
@@ -381,9 +386,6 @@ while True:
             f"train loss {losses['train']:.4f}, "
             f"val loss {losses['val']:.4f}"
         )
-
-        # if losses["val"] < best_val_loss:
-        #     best_val_loss = losses["val"]
 
         print(f"Current val loss: {losses['val']:.4f}")
 
