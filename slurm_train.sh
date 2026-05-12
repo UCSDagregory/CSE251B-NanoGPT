@@ -30,16 +30,16 @@ if [ -f "$HF_TOKEN_ENV_FILE" ]; then
     source "$HF_TOKEN_ENV_FILE"
 elif [ -n "${HF_TOKEN:-}" ]; then
     echo "HF_TOKEN already set in environment."
-else
-    echo "ERROR: Hugging Face token not found."
-    echo "Expected either:"
-    echo "  1. HF_TOKEN already exported in the environment, or"
-    echo "  2. Token file at: $HF_TOKEN_ENV_FILE"
-    echo
-    echo "Create it with:"
-    echo "  echo 'export HF_TOKEN=hf_your_token_here' > \"$REPO/.hf_token_env\""
-    echo "  chmod 600 \"$REPO/.hf_token_env\""
-    exit 1
+#else
+#    echo "ERROR: Hugging Face token not found."
+#    echo "Expected either:"
+#    echo "  1. HF_TOKEN already exported in the environment, or"
+#    echo "  2. Token file at: $HF_TOKEN_ENV_FILE"
+#    echo
+#    echo "Create it with:"
+#    echo "  echo 'export HF_TOKEN=hf_your_token_here' > \"$REPO/.hf_token_env\""
+#    echo "  chmod 600 \"$REPO/.hf_token_env\""
+#    exit 1
 fi
 
 export HF_XET_HIGH_PERFORMANCE=1
@@ -89,7 +89,7 @@ python -m pip install --user --no-cache-dir \
 echo "Dependency check:"
 python -c "import numpy, tqdm, requests, pyarrow, datasets, huggingface_hub, tiktoken; from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam; print('core deps ok')"
 python -c "import torch; print('torch ok:', torch.__version__, 'cuda:', torch.cuda.is_available())"
-python -c "import os; print('HF_TOKEN set:', bool(os.environ.get('HF_TOKEN')))"
+#python -c "import os; print('HF_TOKEN set:', bool(os.environ.get('HF_TOKEN')))"
 
 echo "Repo contents:"
 ls "$REPO"
@@ -100,8 +100,7 @@ if timeout 12h python "$REPO/train.py" \
   --device cuda \
   --type scratch \
   --folder start_dist \
-  --data_fd_name "$REPO/data/mixed-data" \
-  --chpn TEST
+  --data_fd_name "$REPO/data/mixed-data"
 then
     echo "Training finished before timeout."
 else

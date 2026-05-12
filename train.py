@@ -482,10 +482,9 @@ while True:
         iter_num % iters_per_checkpoint == 0
         and iter_num > 0
         and master_process
+        and iter_num%eval_interval != 0
+        and iters_per_checkpoint > 0
     ):
-        if (iter_num%eval_interval == 0 or iters_per_checkpoint <= 0):
-            continue
-
         current_checkpoints = len(os.listdir(model_checkpoint_path))
 
         if current_checkpoints >= max_checkpoints_to_keep:
