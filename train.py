@@ -114,7 +114,7 @@ grad_clip = 1.0
 # learning rate decay settings
 decay_lr = True
 warmup_iters = 500
-lr_decay_iters = max_iters
+lr_decay_iters = 10200
 min_lr = 6e-5
 
 # DDP settings
@@ -240,7 +240,6 @@ def estimate_loss():
     model.train()
     return out
 
-# learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     if OPT_TYPE == "adam":
         base_lr = LEARNING_RATE
