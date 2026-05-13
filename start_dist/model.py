@@ -1,9 +1,11 @@
+import os
+import math
+from typing import Any
+
 import torch
 import torch.nn as nn
-import os
 from torch.nn import functional as F
-from typing import Any
-import math
+
 
 MODEL_CONFIG = "model_config"
 OPT_CONFIG = "optimizer_config"
@@ -14,52 +16,207 @@ CHECKPOINT_DEFAULT = "checkpoints"
 CHECKPOINT_EXT = ".pt"
 MAX_ZEROS_IN_CKPTFN = 8
 
+
+class RMSNorm(nn.Module):
+    """
+    LLaMA-style RMSNorm.
+
+    This replaces LayerNorm. It has only a learned scale parameter and no bias.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Standard RoPE cache for q/k rotation.
+
+    q, k shapes expected by apply_rotary:
+        [batch, n_head, seq_len, head_dim]
+    """
+
+    def __init__(self, dim: int, max_seq_len: int, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RoPE requires an even head_dim, got {dim}")
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        positions = torch.arange(max_seq_len, dtype=torch.float)
+        freqs = torch.outer(positions, inv_freq)  # [max_seq_len, dim / 2]
+
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len = q.size(-2)
+
+        cos = self.cos_cached[:seq_len].to(device=q.device, dtype=q.dtype)
+        sin = self.sin_cached[:seq_len].to(device=q.device, dtype=q.dtype)
+
+        cos = cos[None, None, :, :]  # [1, 1, T, head_dim / 2]
+        sin = sin[None, None, :, :]  # [1, 1, T, head_dim / 2]
+
+        q_even = q[..., ::2]
+        q_odd = q[..., 1::2]
+        k_even = k[..., ::2]
+        k_odd = k[..., 1::2]
+
+        q_rot = torch.empty_like(q)
+        k_rot = torch.empty_like(k)
+
+        q_rot[..., ::2] = q_even * cos - q_odd * sin
+        q_rot[..., 1::2] = q_even * sin + q_odd * cos
+
+        k_rot[..., ::2] = k_even * cos - k_odd * sin
+        k_rot[..., 1::2] = k_even * sin + k_odd * cos
+
+        return q_rot, k_rot
+
+
+class CausalSelfAttention(nn.Module):
+    """
+    Explicit GPT-style causal self-attention with RoPE.
+
+    Uses torch.nn.functional.scaled_dot_product_attention, which will dispatch
+    to a fused/flash attention kernel when available.
+    """
+
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        block_size: int,
+        bias: bool = False,
+        rope_base: float = 10000.0,
+    ):
+        super().__init__()
+
+        if n_embd % n_head != 0:
+            raise ValueError(f"n_embd={n_embd} must be divisible by n_head={n_head}")
+
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+        self.block_size = block_size
+
+        if self.head_dim % 2 != 0:
+            raise ValueError(f"RoPE requires even head_dim, got {self.head_dim}")
+
+        self.qkv_proj = nn.Linear(n_embd, 3 * n_embd, bias=bias)
+        self.out_proj = nn.Linear(n_embd, n_embd, bias=bias)
+        self.rope = RotaryEmbedding(
+            dim=self.head_dim,
+            max_seq_len=block_size,
+            base=rope_base,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, channels = x.shape
+
+        if seq_len > self.block_size:
+            raise ValueError(f"sequence length {seq_len} exceeds block_size {self.block_size}")
+
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(channels, dim=-1)
+
+        q = q.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+
+        q, k = self.rope(q, k)
+
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+        )
+
+        y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, channels)
+        return self.out_proj(y)
+
+
+class SwiGLU(nn.Module):
+    """
+    LLaMA-style SwiGLU feed-forward network.
+
+    Default hidden size is approximately 8/3 * n_embd, rounded to a multiple
+    of 256. This keeps the parameter count similar to a 4x GELU MLP because
+    SwiGLU uses two input projections plus one output projection.
+    """
+
+    def __init__(
+        self,
+        n_embd: int,
+        hidden_dim: int | None = None,
+        multiple_of: int = 256,
+        bias: bool = False,
+    ):
+        super().__init__()
+
+        if hidden_dim is None:
+            hidden_dim = int((8 * n_embd) / 3)
+            hidden_dim = multiple_of * math.ceil(hidden_dim / multiple_of)
+
+        self.hidden_dim = hidden_dim
+
+        self.gate_proj = nn.Linear(n_embd, hidden_dim, bias=bias)
+        self.up_proj = nn.Linear(n_embd, hidden_dim, bias=bias)
+        self.down_proj = nn.Linear(hidden_dim, n_embd, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class GPTBlock(nn.Module):
+    """
+    Pre-norm LLaMA-style decoder block:
+        x = x + Attention(RMSNorm(x))
+        x = x + SwiGLU(RMSNorm(x))
+    """
+
+    def __init__(
+        self,
+        n_embd: int,
+        n_head: int,
+        block_size: int,
+        mlp_hidden_dim: int | None = None,
+        bias: bool = False,
+        rope_base: float = 10000.0,
+    ):
+        super().__init__()
+
+        self.attn_norm = RMSNorm(n_embd)
+        self.attn = CausalSelfAttention(
+            n_embd=n_embd,
+            n_head=n_head,
+            block_size=block_size,
+            bias=bias,
+            rope_base=rope_base,
+        )
+
+        self.mlp_norm = RMSNorm(n_embd)
+        self.mlp = SwiGLU(
+            n_embd=n_embd,
+            hidden_dim=mlp_hidden_dim,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x))
+        x = x + self.mlp(self.mlp_norm(x))
+        return x
+
+
 class nanoGPT(nn.Module):
-    # def __init__(self, model_folder_name:str, chkpt_folder_name:str=None, 
-    #              author:str="N/A", # Metadata args
-    #              vocab_size=50257, n_embd=128, n_head=4, n_layer=2, block_size=1024):
-
-    #     super().__init__()
-    #     self.block_size = block_size
-    #     self.token_emb = nn.Embedding(vocab_size, n_embd)
-    #     self.pos_emb = nn.Embedding(block_size, n_embd)
-    #     self.blocks = nn.ModuleList([
-    #         # nn.TransformerEncoderLayer(
-    #         #     d_model=n_embd, nhead=n_head,
-    #         #     dim_feedforward=4 * n_embd, dropout=0.1,
-    #         #     activation="gelu", batch_first=True,
-    #         # )
-    #         nn.TransformerEncoderLayer(
-    #             norm_first=True,
-    #             d_model=n_embd, nhead=n_head,
-    #             dim_feedforward=4 * n_embd, dropout=0.0,
-    #             activation="gelu", batch_first=True,
-    #         )
-    #         for _ in range(n_layer)
-    #     ])
-    #     self.ln_f = nn.LayerNorm(n_embd)
-    #     self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-    #     self.lm_head.weight = self.token_emb.weight # set the output and input token embeddings to be the same as it can save parameters without losing much accuracy
-
-    #     self.vocab_size = vocab_size
-    #     self.n_layer = n_layer
-    #     self.n_head = n_head
-    #     self.n_embd = n_embd
-    #     self.block_size = block_size
-
-    #     self.num_parameters = sum(val.numel() for val in self.parameters())
-    #     self.author = author
-    #     self.model_path = os.path.join(os.getcwd(), model_folder_name)
-    #     if (chkpt_folder_name is None):
-    #         self.checkpoint_folder_name = CHECKPOINT_DEFAULT
-    #     else:
-    #         self.checkpoint_folder_name = chkpt_folder_name
-
-    #     self.opt_weight_decay = 0
-    #     self.opt_learning_rate = 0
-    #     self.opt_betas = 0
-    #     self.opt_type = "muon"
-
     def __init__(
         self,
         model_folder_name: str,
@@ -70,7 +227,7 @@ class nanoGPT(nn.Module):
         n_head=4,
         n_layer=2,
         block_size=1024,
-        resume=False
+        resume=False,
     ):
         super().__init__()
 
@@ -81,49 +238,48 @@ class nanoGPT(nn.Module):
         self.block_size = block_size
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Embedding(block_size, n_embd)
 
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                norm_first=True,
-                d_model=n_embd,
-                nhead=n_head,
-                dim_feedforward=4 * n_embd,
-                dropout=0.0,
-                activation="gelu",
-                batch_first=True,
-            )
-            for _ in range(n_layer)
-        ])
+        # No learned absolute position embeddings. RoPE is applied to q/k inside attention.
+        self.pos_emb = None
 
-        self.ln_f = nn.LayerNorm(n_embd)
+        self.blocks = nn.ModuleList(
+            [
+                GPTBlock(
+                    n_embd=n_embd,
+                    n_head=n_head,
+                    block_size=block_size,
+                    bias=False,
+                    rope_base=10000.0,
+                )
+                for _ in range(n_layer)
+            ]
+        )
+
+        self.ln_f = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
-        # GPT-style init.
-        if (not resume):
+        if not resume:
             self.apply(self._init_weights)
 
-        # GPT-2-style residual projection scaling.
-        #
-        # In nn.TransformerEncoderLayer:
-        # - self_attn.out_proj projects attention output back into residual stream
-        # - linear2 projects MLP output back into residual stream
-        #
-        # These are scaled by 1 / sqrt(2 * n_layer).
-        for block in self.blocks:
-            nn.init.normal_(
-                block.self_attn.out_proj.weight,
-                mean=0.0,
-                std=0.02 / math.sqrt(2 * n_layer),
-            )
+            # GPT-2/LLaMA-style residual projection scaling.
+            #
+            # In this architecture:
+            # - block.attn.out_proj projects attention output back into the residual stream
+            # - block.mlp.down_proj projects MLP output back into the residual stream
+            for block in self.blocks:
+                nn.init.normal_(
+                    block.attn.out_proj.weight,
+                    mean=0.0,
+                    std=0.02 / math.sqrt(2 * n_layer),
+                )
 
-            nn.init.normal_(
-                block.linear2.weight,
-                mean=0.0,
-                std=0.02 / math.sqrt(2 * n_layer),
-            )
+                nn.init.normal_(
+                    block.mlp.down_proj.weight,
+                    mean=0.0,
+                    std=0.02 / math.sqrt(2 * n_layer),
+                )
 
-        # Tie token embedding and LM head weights after init.
+        # Tie token embedding and output head after initialization.
         self.lm_head.weight = self.token_emb.weight
 
         self.num_parameters = sum(p.numel() for p in self.parameters())
@@ -140,6 +296,8 @@ class nanoGPT(nn.Module):
         self.opt_learning_rate = 0
         self.opt_betas = 0
         self.opt_type = "muon"
+        self.backoff_thresh = None
+        self.backoff_rates = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -151,70 +309,66 @@ class nanoGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
-
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
 
     def forward(self, input_ids, targets=None):
         """
         Args:
             input_ids: LongTensor of shape (batch_size, seq_len)
-        Returns:
-            logits: FloatTensor of shape (batch_size, seq_len, 50257)
-        """
-        B, T = input_ids.shape
-        tok_emb = self.token_emb(input_ids)
-        pos_emb = self.pos_emb(torch.arange(T, device=input_ids.device))
-        x = tok_emb + pos_emb
 
-        # Causal mask
-        mask = torch.triu(torch.ones(T, T, device=input_ids.device), diagonal=1).bool()
+        Returns:
+            If targets is None:
+                logits: FloatTensor of shape (batch_size, seq_len, vocab_size)
+            Else:
+                logits, loss
+        """
+        _, seq_len = input_ids.shape
+
+        if seq_len > self.block_size:
+            raise ValueError(f"sequence length {seq_len} exceeds block_size {self.block_size}")
+
+        x = self.token_emb(input_ids)
 
         for block in self.blocks:
-            x = block(x, src_mask=mask, is_causal=True)
+            x = block(x)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        # else:
-        #     # inference-time mini-optimization: only forward the lm_head on the very last position
-        #     logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-        #     loss = None
-
-        # Evaluation return path, only expects logits
-        if (targets is None):
+        if targets is None:
             return logits
-        # Training return path, wants logits and loss with respect to a target for simplicitly
+
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+        )
+
         return logits, loss
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        """Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS."""
         N = self.num_parameters
-        L, H, Q, T = self.n_layer, self.n_head, self.n_embd//self.n_head, self.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
+        L = self.n_layer
+        H = self.n_head
+        Q = self.n_embd // self.n_head
+        T = self.block_size
+
+        # Approximate transformer flops. This remains an estimate; SwiGLU and SDPA kernels
+        # differ from the old TransformerEncoderLayer implementation.
+        flops_per_token = 6 * N + 12 * L * H * Q * T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        # mfu = flops_achieved
-        return mfu
+        flops_achieved = flops_per_iter * (1.0 / dt)
+
+        flops_promised = 312e12  # A100 bfloat16 peak FLOPS.
+        return flops_achieved / flops_promised
 
     def getCheckpointPath(self):
-        full_path = os.path.join(self.model_path, self.checkpoint_folder_name)
-        return full_path
+        return os.path.join(self.model_path, self.checkpoint_folder_name)
 
-    # file_name -> no extension, the needed one is added in the func. 
-    # def saveCheckpoint(self, file_name:str, epoch:int, optimizer:nn.Module, loss:int):
-    def saveCheckpoint(self, optimizer:nn.Module, val_loss:int, iter_num:int, non_eval_checkpoint=False):
+    def saveCheckpoint(self, optimizer: nn.Module, val_loss: int, iter_num: int, non_eval_checkpoint=False):
         checkpoint = {
             MODEL_CONFIG: {
                 "author": self.author,
@@ -222,43 +376,60 @@ class nanoGPT(nn.Module):
                 "n_embd": self.n_embd,
                 "n_head": self.n_head,
                 "n_layer": self.n_layer,
-                "block_size": self.block_size
+                "block_size": self.block_size,
             },
-            OPT_CONFIG:{
-                "weight_decay":self.opt_weight_decay,
-                "learning_rate":self.opt_learning_rate,
-                "betas":self.opt_betas,
-                "optimizer":self.opt_type,
-                "backoff_thresh":self.backoff_thresh,
-                "backoff_rates":self.backoff_rates
+            OPT_CONFIG: {
+                "weight_decay": self.opt_weight_decay,
+                "learning_rate": self.opt_learning_rate,
+                "betas": self.opt_betas,
+                "optimizer": self.opt_type,
+                "backoff_thresh": self.backoff_thresh,
+                "backoff_rates": self.backoff_rates,
             },
             MODEL_STATE_DICT: self.state_dict(),
             OPTIMIZER_STATE_DICT: optimizer.state_dict(),
             ITER_NUM: iter_num,
         }
-        # Helps with checkpoint coherence on replacement. When a threshold is crossed, eg. 9->10 or 99->100 the checkpoints
-        # will continue to stay sorted and won't have differing filename lengths
+
         copy_iter_num = iter_num
         trailing_zeros = 1
-        while (copy_iter_num >= 10):
+        while copy_iter_num >= 10:
             trailing_zeros += 1
-            copy_iter_num = int(float(copy_iter_num)/10.0)
-        zeros_to_add = MAX_ZEROS_IN_CKPTFN-trailing_zeros
+            copy_iter_num = int(float(copy_iter_num) / 10.0)
+
+        zeros_to_add = MAX_ZEROS_IN_CKPTFN - trailing_zeros
         prefix = ""
-        while(zeros_to_add > 0):
+        while zeros_to_add > 0:
             prefix += "0"
             zeros_to_add -= 1
 
-        save_file_name = f"ITER{prefix}{iter_num}_{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
-        if (non_eval_checkpoint):
-            save_file_name = f"ITER{prefix}{iter_num}_CHKPT{val_loss:08.4f}val_loss" + "_" + nanoGPT.__name__ + "_" + self.author.replace(" ", "") + CHECKPOINT_EXT
+        save_file_name = (
+            f"ITER{prefix}{iter_num}_{val_loss:08.4f}val_loss"
+            + "_"
+            + nanoGPT.__name__
+            + "_"
+            + self.author.replace(" ", "")
+            + CHECKPOINT_EXT
+        )
+
+        if non_eval_checkpoint:
+            save_file_name = (
+                f"ITER{prefix}{iter_num}_CHKPT{val_loss:08.4f}val_loss"
+                + "_"
+                + nanoGPT.__name__
+                + "_"
+                + self.author.replace(" ", "")
+                + CHECKPOINT_EXT
+            )
 
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
+        os.makedirs(os.path.dirname(full_checkpoint_path), exist_ok=True)
         torch.save(checkpoint, full_checkpoint_path)
 
     def configure_optimizers(self, args):
         print(args)
         weight_decay, learning_rate, betas, optimizer_type, bkoff_thresh, bkoff_rates, device_type = args
+
         self.opt_weight_decay = weight_decay
         self.opt_learning_rate = learning_rate
         self.opt_betas = betas
@@ -266,10 +437,10 @@ class nanoGPT(nn.Module):
         self.backoff_thresh = bkoff_thresh
         self.backoff_rates = bkoff_rates
 
-        # gather trainable params once
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
 
         param_groups = None
+
         if optimizer_type == "muon":
             print("Using muon optimizer")
 
@@ -278,10 +449,20 @@ class nanoGPT(nn.Module):
             nonhidden_decay = []
             nonhidden_no_decay = []
 
-            # params that should stay on Adam path, not Muon
+            # Keep token embeddings/output head on Adam path, not Muon.
+            # Important: "token_emb" does not contain "embed", so include explicit emb names.
             nonhidden_keywords = (
-                "embed", "embedding", "wte", "wpe",
-                "head", "lm_head", "output", "classifier",
+                "token_emb",
+                "tok_emb",
+                "wte",
+                "wpe",
+                "pos_emb",
+                "embed",
+                "embedding",
+                "head",
+                "lm_head",
+                "output",
+                "classifier",
             )
 
             seen = set()
@@ -293,28 +474,28 @@ class nanoGPT(nn.Module):
 
                 lname = name.lower()
 
-                # embeddings / output heads stay on Adam path
                 if any(k in lname for k in nonhidden_keywords):
                     if p.ndim >= 2:
-                        nonhidden_decay.append(p)      # embeddings / output matrices
+                        nonhidden_decay.append(p)
                     else:
-                        nonhidden_no_decay.append(p)   # biases / norm scales
-                # hidden matrix weights -> Muon
+                        nonhidden_no_decay.append(p)
                 elif p.ndim >= 2:
                     hidden_weights.append(p)
-                # hidden biases / norm gains -> Adam path
                 else:
                     hidden_gains_biases.append(p)
 
             num_hidden_weights = sum(p.numel() for p in hidden_weights)
             num_hidden_gains_biases = sum(p.numel() for p in hidden_gains_biases)
-            num_nonhidden_params = sum(p.numel() for p in nonhidden_decay)
+            num_nonhidden_decay = sum(p.numel() for p in nonhidden_decay)
+            num_nonhidden_no_decay = sum(p.numel() for p in nonhidden_no_decay)
 
             print(f"num muon parameter tensors: {len(hidden_weights)}, with {num_hidden_weights:,} parameters")
             print(f"num hidden gain/bias tensors: {len(hidden_gains_biases)}, with {num_hidden_gains_biases:,} parameters")
-            print(f"num nonhidden parameter tensors: {len(nonhidden_decay)}, with {num_nonhidden_params:,} parameters")
+            print(f"num nonhidden decay tensors: {len(nonhidden_decay)}, with {num_nonhidden_decay:,} parameters")
+            print(f"num nonhidden no-decay tensors: {len(nonhidden_no_decay)}, with {num_nonhidden_no_decay:,} parameters")
 
-            hidden_lr,nonhidden_lr = learning_rate[0], learning_rate[1]
+            hidden_lr, nonhidden_lr = learning_rate[0], learning_rate[1]
+
             param_groups = [
                 dict(
                     params=hidden_weights,
@@ -334,29 +515,49 @@ class nanoGPT(nn.Module):
                     use_muon=False,
                     lr=nonhidden_lr,
                     betas=betas,
-                    weight_decay=0.0,  # or smaller, e.g. 0.01
+                    weight_decay=0.0,
                 ),
             ]
 
         if optimizer_type == "adam":
-            # default AdamW path
             decay_params = []
             nodecay_params = []
             seen = set()
 
-            for _, p in param_dict.items():
+            for name, p in param_dict.items():
                 if id(p) in seen:
                     continue
                 seen.add(id(p))
 
-                if p.dim() >= 2:
-                    decay_params.append(p)
-                else:
+                lname = name.lower()
+                is_norm = "norm" in lname
+                is_bias_or_gain = p.ndim < 2
+                is_embedding_or_head = any(
+                    k in lname
+                    for k in (
+                        "token_emb",
+                        "tok_emb",
+                        "wte",
+                        "wpe",
+                        "pos_emb",
+                        "embed",
+                        "embedding",
+                        "head",
+                        "lm_head",
+                        "output",
+                        "classifier",
+                    )
+                )
+
+                # For this project, keep embeddings/head/norms un-decayed by default.
+                if is_bias_or_gain or is_norm or is_embedding_or_head:
                     nodecay_params.append(p)
+                else:
+                    decay_params.append(p)
 
             param_groups = [
-                {"params": decay_params, "weight_decay": weight_decay},
-                {"params": nodecay_params, "weight_decay": 0.0},
+                {"params": decay_params, "weight_decay": weight_decay, "lr": learning_rate, "betas": betas},
+                {"params": nodecay_params, "weight_decay": 0.0, "lr": learning_rate, "betas": betas},
             ]
 
             num_decay_params = sum(p.numel() for p in decay_params)
@@ -364,68 +565,78 @@ class nanoGPT(nn.Module):
             print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
             print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
 
-            param_groups.append(learning_rate)
-            param_groups.append(betas)
-
-        if (param_groups is None):
+        if param_groups is None:
             raise ValueError(f"Invalid optimizer type: {optimizer_type}")
 
         return [param_groups, optimizer_type, device_type]
-        
+
 
 def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A", resume=False):
     model_args = [model_folder_name, chkpt_folder_name]
+
     model_saved_config = checkpoint[MODEL_CONFIG]
     for key in model_saved_config:
         model_args.append(model_saved_config[key])
+
     model_args.append(resume)
+
     opt_args = []
     opt_saved_config = checkpoint[OPT_CONFIG]
     for key in opt_saved_config:
         opt_args.append(opt_saved_config[key])
+
     return model_args, opt_args
 
-def loadFromCheckpoint(model_folder_name:str, checkpoint_file_path:str) -> tuple[nn.Module, Any, Any, Any, int]:
-    split_path = checkpoint_file_path.split('/')
-    if (len(split_path) != 2):
+
+def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str) -> tuple[nn.Module, Any, Any, Any, int]:
+    split_path = checkpoint_file_path.split("/")
+
+    if len(split_path) != 2:
         raise ValueError("Checkpoint path should only be folder_name/checkpoint_to_load.ext")
-    chkpt_folder_name, ckpt_file_name  = split_path
+
+    chkpt_folder_name, ckpt_file_name = split_path
     load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
+
     checkpoint = torch.load(load_path, weights_only=True)
     model_args, opt_args = getArgs(checkpoint, model_folder_name, chkpt_folder_name, resume=True)
+
     gpt_model = nanoGPT(*model_args)
     gpt_model.checkpoint_folder_name = chkpt_folder_name
-    
+
     model_sd = checkpoint[MODEL_STATE_DICT]
     opt_sd = checkpoint[OPTIMIZER_STATE_DICT]
     iter_num = checkpoint[ITER_NUM]
+
     checkpoint = None
+
     return gpt_model, model_sd, opt_args, opt_sd, iter_num
 
-# --- Required: load_model function ---
+
 def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     """
     Load your trained model from a checkpoint.
 
     This function is called by evaluate.py. It must return a model where:
         model(input_ids) -> logits
-        - input_ids: LongTensor of shape (batch, seq_len)
-        - logits: FloatTensor of shape (batch, seq_len, 50257)
 
     Args:
-        checkpoint_path: Path to your checkpoint.pt file
-        device: Device to load onto ("cuda" or "cpu")
+        checkpoint_path: Path to checkpoint .pt file.
+        device: "cuda" or "cpu".
 
     Returns:
-        model: nn.Module in eval mode
+        model in eval mode.
     """
-    # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model_args, opt_args = getArgs(checkpoint, resume=True)
+    model_args, _ = getArgs(checkpoint, resume=True)
+
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])
+
     checkpoint = None
+
     print(f"#Params: {model.num_parameters}")
+
     model.to(device)
     model.eval()
+
     return model
