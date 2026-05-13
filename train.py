@@ -312,6 +312,7 @@ losses['val'] = 999.0
 print(f"Warmup iters for:{warmup_iters}\n")
 
 MAX_SCALAR = 1.5
+MIN_SCALAR = 0.40
 k_gradients = 4
 validation_losses = []
 lr_scalars = []
@@ -370,7 +371,8 @@ while True:
             # If it's below the threshold we need to try a lower LR
             if (pairwise_gradient_avg <= backoff_threshold and pairwise_gradient_avg >= -1.0*backoff_threshold):
                 for idx in range(len(lr_scalars)):
-                    lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
+                    # lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
+                    lr_scalars[idx] = max(MIN_SCALAR, (lr_scalars[idx]-((lr_scalars[idx]-MIN_SCALAR)*(backoff_rates[idx]))))
                 validation_losses = []
             
             # We're in a good regime and we should scale up
