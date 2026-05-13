@@ -128,7 +128,8 @@ iters_per_checkpoint = 50
 max_checkpoints_to_keep = 4 
 
 dataset = args.data_fd_name
-effective_batch_size = 96
+# effective_batch_size = 96
+effective_batch_size = 1
 # Important note
 # batch_size exists to be memory efficient, if there isn't enough space in the GPU memory it will spill over into SMEM (shared memory)
 # which is significantly slower than it just living in VRAM
@@ -143,9 +144,9 @@ effective_batch_size = 96
 # It's been changed s.t. the user now fixes effective_batch_size to a number they deem reasonable for clean gradients and batch_size to ensure training is as performant as possible
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
-batch_size = 48 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# batch_size = 48 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-# batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -164,7 +165,10 @@ decay_lr = True # whether to decay the learning rate
 # warmup_iters = 10 # how many steps to warm up for
 warmup_iters = max(25,int(0.05*float(max_iters))) # how many steps to warm up for
 lr_decay_iters = int(max_iters*1.0) # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = []
+for lr in LEARNING_RATE:
+    min_lr.append(lr/8.0)
+# min_lr = LEARNING_RATE # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -284,17 +288,42 @@ def estimate_loss():
     return out
 
 
-def get_lr(it, val_losses=None):
+# def get_lr(it, val_losses=None):
+#     if (OPT_TYPE == 'adam'):
+#         raise ValueError("Scheduler not yet setup for ADAM")
+#     if (it < warmup_iters):
+#         new_lr = []
+#         for lr in LEARNING_RATE:
+#             warmup_lr = (max(1.0, float(it)) / float(warmup_iters)) * lr
+#             new_lr.append(warmup_lr)
+#         return new_lr
+#     else:
+#         return LEARNING_RATE.copy()
+
+def get_lr(it):
     if (OPT_TYPE == 'adam'):
         raise ValueError("Scheduler not yet setup for ADAM")
+    
+    # else:
+    #     hidden_base_lr, nonhidden_base_lr = LEARNING_RATE
+
+    # 1) linear warmup for warmup_iters steps
     if (it < warmup_iters):
         new_lr = []
         for lr in LEARNING_RATE:
             warmup_lr = (max(1.0, float(it)) / float(warmup_iters)) * lr
             new_lr.append(warmup_lr)
         return new_lr
-    else:
-        return LEARNING_RATE.copy()
+
+    # 3) cosine decay from base lr down to min lr
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+
+    LR_RETURN = LEARNING_RATE.copy()
+    for idx in range(len(LR_RETURN)):
+        LR_RETURN[idx] = min_lr[idx] + coeff * (LR_RETURN[idx] - min_lr[idx])
+    return LR_RETURN
 
 # training loop
 X, Y = batch_helper.get_batch('train') # fetch the very first batch
@@ -366,20 +395,20 @@ while True:
             for idx in range(1, len(validation_losses)):
                 pairwise_gradient_avg += (validation_losses[idx] / validation_losses[idx-1])-1.0
 
-            pairwise_gradient_avg = (pairwise_gradient_avg) / len(validation_losses)-1.0 # -1 for unbiased estimator
+            pairwise_gradient_avg = (pairwise_gradient_avg) / len(validation_losses) # -1 for unbiased estimator
             print(f"Avg gradient for loss of past {k_gradients} validation losses: {pairwise_gradient_avg:0.3f}")
             # If it's below the threshold we need to try a lower LR
-            if (pairwise_gradient_avg <= backoff_threshold and pairwise_gradient_avg >= -1.0*backoff_threshold):
-                for idx in range(len(lr_scalars)):
-                    # lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
-                    lr_scalars[idx] = max(MIN_SCALAR, (lr_scalars[idx]-((lr_scalars[idx]-MIN_SCALAR)*(backoff_rates[idx]))))
-                validation_losses = []
+            # if (pairwise_gradient_avg <= backoff_threshold and pairwise_gradient_avg >= -1.0*backoff_threshold):
+            #     for idx in range(len(lr_scalars)):
+            #         # lr_scalars[idx] = lr_scalars[idx]*backoff_rates[idx]
+            #         lr_scalars[idx] = max(MIN_SCALAR, (lr_scalars[idx]-((lr_scalars[idx]-MIN_SCALAR)*(backoff_rates[idx]))))
+            #     validation_losses = []
             
-            # We're in a good regime and we should scale up
-            if (pairwise_gradient_avg < -1.0*backoff_threshold):
-                for idx in range(len(lr_scalars)):
-                    lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*(1.0-backoff_rates[idx])) + lr_scalars[idx])
-                validation_losses = []
+            # # We're in a good regime and we should scale up
+            # if (pairwise_gradient_avg < -1.0*backoff_threshold):
+            #     for idx in range(len(lr_scalars)):
+            #         lr_scalars[idx] = min(MAX_SCALAR, ((MAX_SCALAR-lr_scalars[idx])*(1.0-backoff_rates[idx])) + lr_scalars[idx])
+            #     validation_losses = []
             # Remove the previous values to give the new change time to take affect
 
 
