@@ -18,12 +18,6 @@ MAX_ZEROS_IN_CKPTFN = 8
 
 
 class RMSNorm(nn.Module):
-    """
-    LLaMA-style RMSNorm.
-
-    This replaces LayerNorm. It has only a learned scale parameter and no bias.
-    """
-
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -34,21 +28,15 @@ class RMSNorm(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    """
-    Standard RoPE cache for q/k rotation.
-
-    q, k shapes expected by apply_rotary:
-        [batch, n_head, seq_len, head_dim]
-    """
-
     def __init__(self, dim: int, max_seq_len: int, base: float = 10000.0):
         super().__init__()
+
         if dim % 2 != 0:
             raise ValueError(f"RoPE requires an even head_dim, got {dim}")
 
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         positions = torch.arange(max_seq_len, dtype=torch.float)
-        freqs = torch.outer(positions, inv_freq)  # [max_seq_len, dim / 2]
+        freqs = torch.outer(positions, inv_freq)
 
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
@@ -59,8 +47,8 @@ class RotaryEmbedding(nn.Module):
         cos = self.cos_cached[:seq_len].to(device=q.device, dtype=q.dtype)
         sin = self.sin_cached[:seq_len].to(device=q.device, dtype=q.dtype)
 
-        cos = cos[None, None, :, :]  # [1, 1, T, head_dim / 2]
-        sin = sin[None, None, :, :]  # [1, 1, T, head_dim / 2]
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
 
         q_even = q[..., ::2]
         q_odd = q[..., 1::2]
@@ -80,13 +68,6 @@ class RotaryEmbedding(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    """
-    Explicit GPT-style causal self-attention with RoPE.
-
-    Uses torch.nn.functional.scaled_dot_product_attention, which will dispatch
-    to a fused/flash attention kernel when available.
-    """
-
     def __init__(
         self,
         n_embd: int,
@@ -94,6 +75,7 @@ class CausalSelfAttention(nn.Module):
         block_size: int,
         bias: bool = False,
         rope_base: float = 10000.0,
+        attn_dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -104,6 +86,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = n_head
         self.head_dim = n_embd // n_head
         self.block_size = block_size
+        self.attn_dropout = float(attn_dropout)
 
         if self.head_dim % 2 != 0:
             raise ValueError(f"RoPE requires even head_dim, got {self.head_dim}")
@@ -136,7 +119,7 @@ class CausalSelfAttention(nn.Module):
             k,
             v,
             attn_mask=None,
-            dropout_p=0.0,
+            dropout_p=self.attn_dropout if self.training else 0.0,
             is_causal=True,
         )
 
@@ -145,14 +128,6 @@ class CausalSelfAttention(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    """
-    LLaMA-style SwiGLU feed-forward network.
-
-    Default hidden size is approximately 8/3 * n_embd, rounded to a multiple
-    of 256. This keeps the parameter count similar to a 4x GELU MLP because
-    SwiGLU uses two input projections plus one output projection.
-    """
-
     def __init__(
         self,
         n_embd: int,
@@ -177,12 +152,6 @@ class SwiGLU(nn.Module):
 
 
 class GPTBlock(nn.Module):
-    """
-    Pre-norm LLaMA-style decoder block:
-        x = x + Attention(RMSNorm(x))
-        x = x + SwiGLU(RMSNorm(x))
-    """
-
     def __init__(
         self,
         n_embd: int,
@@ -191,6 +160,8 @@ class GPTBlock(nn.Module):
         mlp_hidden_dim: int | None = None,
         bias: bool = False,
         rope_base: float = 10000.0,
+        dropout: float = 0.0,
+        attn_dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -201,6 +172,7 @@ class GPTBlock(nn.Module):
             block_size=block_size,
             bias=bias,
             rope_base=rope_base,
+            attn_dropout=attn_dropout,
         )
 
         self.mlp_norm = RMSNorm(n_embd)
@@ -210,9 +182,17 @@ class GPTBlock(nn.Module):
             bias=bias,
         )
 
+        # Residual-branch dropout.
+        #
+        # This is the safest first dropout test for a late-stage checkpoint:
+        # it regularizes the residual updates without dropping token embeddings
+        # and without directly perturbing attention probabilities unless
+        # attn_dropout is set separately.
+        self.resid_dropout = nn.Dropout(float(dropout))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.mlp(self.mlp_norm(x))
+        x = x + self.resid_dropout(self.attn(self.attn_norm(x)))
+        x = x + self.resid_dropout(self.mlp(self.mlp_norm(x)))
         return x
 
 
@@ -228,6 +208,8 @@ class nanoGPT(nn.Module):
         n_layer=2,
         block_size=1024,
         resume=False,
+        dropout=0.1,
+        attn_dropout=0.0,
     ):
         super().__init__()
 
@@ -236,6 +218,8 @@ class nanoGPT(nn.Module):
         self.n_head = n_head
         self.n_embd = n_embd
         self.block_size = block_size
+        self.dropout = float(dropout)
+        self.attn_dropout = float(attn_dropout)
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
 
@@ -250,6 +234,8 @@ class nanoGPT(nn.Module):
                     block_size=block_size,
                     bias=False,
                     rope_base=10000.0,
+                    dropout=self.dropout,
+                    attn_dropout=self.attn_dropout,
                 )
                 for _ in range(n_layer)
             ]
@@ -262,10 +248,6 @@ class nanoGPT(nn.Module):
             self.apply(self._init_weights)
 
             # GPT-2/LLaMA-style residual projection scaling.
-            #
-            # In this architecture:
-            # - block.attn.out_proj projects attention output back into the residual stream
-            # - block.mlp.down_proj projects MLP output back into the residual stream
             for block in self.blocks:
                 nn.init.normal_(
                     block.attn.out_proj.weight,
@@ -313,16 +295,6 @@ class nanoGPT(nn.Module):
             nn.init.ones_(module.weight)
 
     def forward(self, input_ids, targets=None):
-        """
-        Args:
-            input_ids: LongTensor of shape (batch_size, seq_len)
-
-        Returns:
-            If targets is None:
-                logits: FloatTensor of shape (batch_size, seq_len, vocab_size)
-            Else:
-                logits, loss
-        """
         _, seq_len = input_ids.shape
 
         if seq_len > self.block_size:
@@ -348,21 +320,18 @@ class nanoGPT(nn.Module):
         return logits, loss
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS."""
         N = self.num_parameters
         L = self.n_layer
         H = self.n_head
         Q = self.n_embd // self.n_head
         T = self.block_size
 
-        # Approximate transformer flops. This remains an estimate; SwiGLU and SDPA kernels
-        # differ from the old TransformerEncoderLayer implementation.
         flops_per_token = 6 * N + 12 * L * H * Q * T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         flops_achieved = flops_per_iter * (1.0 / dt)
 
-        flops_promised = 312e12  # A100 bfloat16 peak FLOPS.
+        flops_promised = 312e12
         return flops_achieved / flops_promised
 
     def getCheckpointPath(self):
@@ -377,6 +346,8 @@ class nanoGPT(nn.Module):
                 "n_head": self.n_head,
                 "n_layer": self.n_layer,
                 "block_size": self.block_size,
+                "dropout": self.dropout,
+                "attn_dropout": self.attn_dropout,
             },
             OPT_CONFIG: {
                 "weight_decay": self.opt_weight_decay,
@@ -449,8 +420,6 @@ class nanoGPT(nn.Module):
             nonhidden_decay = []
             nonhidden_no_decay = []
 
-            # Keep token embeddings/output head on Adam path, not Muon.
-            # Important: "token_emb" does not contain "embed", so include explicit emb names.
             nonhidden_keywords = (
                 "token_emb",
                 "tok_emb",
@@ -549,7 +518,6 @@ class nanoGPT(nn.Module):
                     )
                 )
 
-                # For this project, keep embeddings/head/norms un-decayed by default.
                 if is_bias_or_gain or is_norm or is_embedding_or_head:
                     nodecay_params.append(p)
                 else:
@@ -572,13 +540,27 @@ class nanoGPT(nn.Module):
 
 
 def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A", resume=False):
-    model_args = [model_folder_name, chkpt_folder_name]
+    """
+    Checkpoint-compatible argument reconstruction.
 
-    model_saved_config = checkpoint[MODEL_CONFIG]
-    for key in model_saved_config:
-        model_args.append(model_saved_config[key])
+    Old checkpoints may not have dropout/attn_dropout.
+    New checkpoints save both. This function handles both cases safely.
+    """
+    cfg = checkpoint[MODEL_CONFIG]
 
-    model_args.append(resume)
+    model_args = [
+        model_folder_name,
+        chkpt_folder_name,
+        cfg.get("author", "N/A"),
+        cfg["vocab_size"],
+        cfg["n_embd"],
+        cfg["n_head"],
+        cfg["n_layer"],
+        cfg["block_size"],
+        resume,
+        cfg.get("dropout", 0.0),
+        cfg.get("attn_dropout", 0.0),
+    ]
 
     opt_args = []
     opt_saved_config = checkpoint[OPT_CONFIG]
@@ -613,19 +595,6 @@ def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str) -> tup
 
 
 def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
-    """
-    Load your trained model from a checkpoint.
-
-    This function is called by evaluate.py. It must return a model where:
-        model(input_ids) -> logits
-
-    Args:
-        checkpoint_path: Path to checkpoint .pt file.
-        device: "cuda" or "cpu".
-
-    Returns:
-        model in eval mode.
-    """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model_args, _ = getArgs(checkpoint, resume=True)
 

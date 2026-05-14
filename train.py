@@ -98,9 +98,9 @@ if (arg_opt_path is None):
     arg_opt_path = OPT_FILENAME
     overwrite_optimizer = False
 
-load_opt_state = False
+load_opt_state = True
 if (not args.reload_opt_state is None):
-    load_opt_state = True
+    load_opt_state = False
 opt_path = os.path.join(model_path, arg_opt_path)
 parsed_opt_args = parseOptParams(opt_path)
 
