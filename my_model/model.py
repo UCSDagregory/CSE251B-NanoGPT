@@ -31,6 +31,37 @@ class RMSNorm(nn.Module):
         return (x.float() * norm).type_as(x) * self.weight
 
 
+class RotaryEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE). No learnable parameters."""
+    def __init__(self, head_dim, max_seq_len=2048, base=10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Precompute cos/sin for max sequence length
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)  # (max_seq_len, head_dim/2)
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+
+    def forward(self, seq_len):
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+
+def apply_rotary_emb(x, cos, sin):
+    """Apply rotary embeddings to input tensor x of shape (B, n_head, T, head_dim)."""
+    # Split x into even and odd dimensions
+    x1 = x[..., 0::2]  # (B, n_head, T, head_dim/2)
+    x2 = x[..., 1::2]  # (B, n_head, T, head_dim/2)
+    # cos, sin are (T, head_dim/2) -> reshape to (1, 1, T, head_dim/2)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    # Apply rotation
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    # Interleave back
+    return torch.stack((out1, out2), dim=-1).flatten(-2)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, n_embd, n_head, block_size, dropout=0.0):
         super().__init__()
@@ -53,6 +84,9 @@ class CausalSelfAttention(nn.Module):
 
         self.use_flash = hasattr(F, "scaled_dot_product_attention")
 
+        # RoPE
+        self.rotary_emb = RotaryEmbedding(self.head_dim, max_seq_len=block_size)
+
     def forward(self, x):
         B, T, C = x.size()
 
@@ -62,6 +96,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE to Q and K
+        cos, sin = self.rotary_emb(T)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
 
         if self.use_flash:
             y = F.scaled_dot_product_attention(
@@ -139,7 +178,7 @@ class nanoGPT(nn.Module):
         self.n_embd = n_embd
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Embedding(block_size, n_embd)
+        # No pos_emb — RoPE handles positional information inside attention
         self.drop = nn.Dropout(dropout)
 
         self.blocks = nn.ModuleList([
@@ -183,8 +222,8 @@ class nanoGPT(nn.Module):
         assert T <= self.block_size, f"Sequence length {T} exceeds block_size {self.block_size}"
 
         tok_emb = self.token_emb(input_ids)
-        pos_emb = self.pos_emb(torch.arange(T, device=input_ids.device))
-        x = self.drop(tok_emb + pos_emb)
+        # No positional embedding added — RoPE is applied inside attention
+        x = self.drop(tok_emb)
 
         for block in self.blocks:
             x = block(x)
@@ -381,7 +420,7 @@ def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str) -> tup
         raise ValueError("Checkpoint path should be folder_name/checkpoint_to_load.ext")
     chkpt_folder_name, ckpt_file_name = split_path
     load_path = os.path.join(os.getcwd(), model_folder_name, chkpt_folder_name, ckpt_file_name)
-    checkpoint = torch.load(load_path, weights_only=False)
+    checkpoint = torch.load(load_path, weights_only=True)
     model_args, opt_args = getArgs(checkpoint, model_folder_name, chkpt_folder_name)
     gpt_model = nanoGPT(*model_args)
     gpt_model.checkpoint_folder_name = chkpt_folder_name
@@ -397,7 +436,7 @@ def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
     Load trained model from checkpoint. Called by evaluate.py.
     Returns model where: model(input_ids) -> logits
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model_args, _ = getArgs(checkpoint)
     model = nanoGPT(*model_args)
     model.load_state_dict(checkpoint[MODEL_STATE_DICT])

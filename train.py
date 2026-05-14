@@ -99,7 +99,7 @@ log_interval = 10
 eval_iters = 50
 eval_only = False
 iters_per_checkpoint = 500
-max_checkpoints_to_keep = 5
+max_checkpoints_to_keep = 2
 
 # data
 dataset = args.data_fd_name
@@ -108,7 +108,7 @@ batch_size = 4                    # micro-batch size -- 99M params on 16GB T4
 block_size = 1024                 # Defined by project specs, DO NOT CHANGE
 
 # training length
-max_iters = 10200                 # ~1B tokens seen (10200 * 98304 = ~1.003B)
+max_iters = 20400                 # ~1B tokens seen (10200 * 98304 = ~1.003B)
 grad_clip = 1.0
 
 # learning rate decay settings
