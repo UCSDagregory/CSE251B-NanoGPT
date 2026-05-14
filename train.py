@@ -248,6 +248,7 @@ elif init_from == 'resume':
     backoff_threshold, backoff_rates = opt_args[-2:]
     opt_args.append(device_type)
     max_iters += iter_num
+    lr_decay_iters += iter_num
     model.load_state_dict(model_sd)
     model.to(device)
     formatted_opt_args = model.configure_optimizers(opt_args)
