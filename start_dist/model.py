@@ -208,7 +208,7 @@ class nanoGPT(nn.Module):
         n_layer=2,
         block_size=1024,
         resume=False,
-        dropout=0.1,
+        dropout=0.0,
         attn_dropout=0.0,
     ):
         super().__init__()
