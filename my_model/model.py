@@ -66,13 +66,16 @@ class SwiGLUExpert(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class SparseMoE(nn.Module):
-    """Routes tokens to the Top-K experts and computes Auxiliary Load Balancing Loss."""
+    """Routes tokens to the Top-K experts and computes Auxiliary & Z-Loss."""
     def __init__(self, n_embd, num_experts, top_k):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.router = nn.Linear(n_embd, num_experts, bias=False)
         self.experts = nn.ModuleList([SwiGLUExpert(n_embd) for _ in range(num_experts)])
+        
+        # Industry standard Z-Loss coefficient is usually around 0.001
+        self.z_loss_coef = 0.001 
 
     def forward(self, x):
         B, T, C = x.shape
@@ -81,45 +84,44 @@ class SparseMoE(nn.Module):
         router_logits = self.router(x)
         routing_probs = F.softmax(router_logits, dim=-1)
 
-        # --- Aux Loss Calculation ---
+        # --- Router Loss Calculations ---
+        # A. Load Balancing Loss
         mean_probs = routing_probs.mean(dim=(0, 1))
         top_k_weights, top_k_indices = torch.topk(routing_probs, self.top_k, dim=-1)
-
-        # Fraction of tokens routed to each expert (flattened to 1D for bincount)
         flat_indices_1d = top_k_indices.view(-1)
         counts = torch.bincount(flat_indices_1d, minlength=self.num_experts).to(x.dtype)
         route_frac = counts / (B * T * self.top_k)
-
-        # Load balancing loss
         aux_loss = self.num_experts * torch.sum(mean_probs * route_frac)
-        # ----------------------------
 
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True) # Normalize
+        # B. Router Z-Loss
+        # Penalizes large routing logits using logsumexp
+        z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+        
+        # Combine them (Note: this whole term will later be multiplied by your 
+        # aux_loss_coef of 0.01 in the main nanoGPT loop)
+        combined_router_loss = aux_loss + (self.z_loss_coef * z_loss)
+        # --------------------------------
+
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
 
         # 3. Route tokens
-        flat_x = x.view(-1, C) # [B*T, C]
-        flat_indices = top_k_indices.view(-1, self.top_k) # [B*T, top_k]
-        flat_weights = top_k_weights.view(-1, self.top_k) # [B*T, top_k]
-        flat_output = torch.zeros_like(flat_x) # [B*T, C]
+        flat_x = x.view(-1, C) 
+        flat_indices = top_k_indices.view(-1, self.top_k) 
+        flat_weights = top_k_weights.view(-1, self.top_k) 
+        flat_output = torch.zeros_like(flat_x) 
 
         for i, expert in enumerate(self.experts):
             # Mask of shape [B*T, top_k]
             expert_mask = (flat_indices == i)
-
-            # Mask of shape [B*T] indicating if token goes to expert 'i'
             token_mask = expert_mask.any(dim=-1)
-
+            
             if token_mask.any():
                 expert_inputs = flat_x[token_mask]
                 expert_outputs = expert(expert_inputs)
-
-                # Extract routing weights for this expert and sum over top_k dimension
                 weights = (flat_weights[token_mask] * expert_mask[token_mask].float()).sum(dim=-1, keepdim=True)
-
-                # Apply weights and accumulate
                 flat_output[token_mask] += expert_outputs * weights
 
-        return flat_output.view(B, T, C), aux_loss
+        return flat_output.view(B, T, C), combined_router_loss
 
 class CausalSelfAttention(nn.Module):
     """Standard Multi-Head Attention using efficient Flash Attention + RoPE."""
