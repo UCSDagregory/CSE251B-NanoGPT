@@ -124,7 +124,7 @@ eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
 # eval_iters = 10 # How many times to calculate val.loss per 'eval interval'
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-iters_per_checkpoint = 0
+iters_per_checkpoint = -1
 max_checkpoints_to_keep = 4 
 
 dataset = args.data_fd_name
