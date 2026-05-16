@@ -98,10 +98,9 @@ echo "Starting training smoke test..."
 
 if timeout 12h python "$REPO/train.py" \
   --device cuda \
-  --type resume \
+  --type scratch \
   --folder start_dist \
-  --data_fd_name "$REPO/data/mixed-data" \
-  --chpr checkpoints/ITER00033000_003.2923val_loss_nanoGPT_DaginGregory.pt
+  --data_fd_name "$REPO/data/mixed-data"
 then
     echo "Training finished before timeout."
 else
