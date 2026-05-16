@@ -5,6 +5,7 @@
 *.bin
 DG_*
 .*env
+start_dist
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
