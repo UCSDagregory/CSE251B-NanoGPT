@@ -1,0 +1,7 @@
+{
+  "revision": "main",
+  "repos": [
+    { "repo_id": "123Ginger321/mixed-data", "weight": 0.7, "revision": "main" },
+    { "repo_id": "123Ginger321/mixed-data", "weight": 0.3, "revision": "7030" }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "raw_backend": {
+    "global_raw_buffer_bytes": "10GiB",
+    "raw_queue_max_batches": 256,
+    "global_token_queue_max_batches": 64,
+    "tokenizer_workers": 6
+  },
+  "sources": [
+    {
+      "backend": "hf_bin",
+      "name": "ginger_mixed_data_7030",
+      "repo_id": "123Ginger321/mixed-data",
+      "revision": "7030",
+      "weight": 0.31
+    },
+    {
+      "backend": "hf_raw_text",
+      "name": "fineweb_edu_sample_10bt",
+      "dataset": "HuggingFaceFW/fineweb-edu",
+      "dataset_config": "sample-10BT",
+      "split": "train",
+      "text_column": "text",
+      "tokenizer": "gpt2",
+      "append_eot": true,
+      "weight": 0.23
+    },
+    {
+      "backend": "hf_raw_text",
+      "name": "fineweb_sample_10bt",
+      "dataset": "HuggingFaceFW/fineweb",
+      "dataset_config": "sample-10BT",
+      "split": "train",
+      "text_column": "text",
+      "tokenizer": "gpt2",
+      "append_eot": true,
+      "weight": 0.17
+    },
+    {
+      "backend": "hf_raw_text",
+      "name": "openwebtext",
+      "dataset": "Skylion007/openwebtext",
+      "dataset_config": "plain_text",
+      "split": "train",
+      "text_column": "text",
+      "tokenizer": "gpt2",
+      "append_eot": true,
+      "weight": 0.13
+    },
+    {
+      "backend": "hf_raw_text",
+      "name": "wikitext_103_raw",
+      "dataset": "Salesforce/wikitext",
+      "dataset_config": "wikitext-103-raw-v1",
+      "split": "train",
+      "text_column": "text",
+      "tokenizer": "gpt2",
+      "append_eot": true,
+      "weight": 0.10
+    },
+    {
+      "backend": "hf_raw_text",
+      "name": "wikipedia_20231101_en",
+      "dataset": "wikimedia/wikipedia",
+      "dataset_config": "20231101.en",
+      "split": "train",
+      "text_column": "text",
+      "tokenizer": "gpt2",
+      "append_eot": true,
+      "weight": 0.06
+    }
+  ]
+}

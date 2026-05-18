@@ -1,21 +1,3 @@
-"""
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
-
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-"""
-
 import os
 import time
 import math
@@ -45,7 +27,7 @@ backoff_threshold, backoff_rates = None, None
 # python train.py --device cuda --type resume --folder my_model --data_fd_name data/shakespeare_char --chpr checkpoints/077.5488val_loss_nanoGPT_DaginGregory.pt
 
 # Example to train a model from scratch
-# python train.py --device cuda --type scratch --folder my_model --data_fd_name data/shakespeare_char
+# python train.py --device cuda --type scratch --folder my_model --data_fd_name data/shakespeare
 
 def parseOptParams(file_path):
     global LEARNING_RATE
@@ -69,10 +51,21 @@ parser.add_argument("--chpr", required=False) # folder_name/checkpoint_file_name
 parser.add_argument("--opt_name", required=False)
 parser.add_argument("--reload_opt_state", required=False, default=None)
 parser.add_argument("--data_collection", required=False)
-parser.add_argument("--stream", required=False, default='F') # if T then will use streaming rather than looking for files on disk
-parser.add_argument("--stream_config", required=False, default=None)
+
+parser.add_argument("--pool_size", required=False, default=2 * 1024**3)
+parser.add_argument("--async_pool", required=False, default=None)
+parser.add_argument("--loader_cfg_name", required=False, default='dataloader_config.json')
 
 args = parser.parse_args()
+
+loader_async_pool = True
+if (not args.async_pool is None):
+    loader_async_pool = False
+
+pool_size = int(args.pool_size)
+
+loader_config_name = args.loader_cfg_name
+print(f"using {loader_config_name} as dataloader config")
 
 init_from:str = args.type
 
@@ -107,16 +100,6 @@ parsed_opt_args = parseOptParams(opt_path)
 if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
-is_streaming = False
-if (args.stream == 'T'):
-    is_streaming = True
-
-streaming_config = args.stream_config
-if (not args.stream_config is None):
-    if (not is_streaming):
-        raise ValueError("Not allowed to define a stream config when not streaming.")
-    streaming_config = args.stream_config
-
 eval_interval = 500 # How many iters until re-calculate val. loss
 # eval_interval = 1 # How many iters until re-calculate val. loss
 log_interval = 1
@@ -128,7 +111,8 @@ iters_per_checkpoint = -1
 max_checkpoints_to_keep = 4 
 
 dataset = args.data_fd_name
-effective_batch_size = 96
+# effective_batch_size = 96
+effective_batch_size = 1
 # Important note
 # batch_size exists to be memory efficient, if there isn't enough space in the GPU memory it will spill over into SMEM (shared memory)
 # which is significantly slower than it just living in VRAM
@@ -143,9 +127,9 @@ effective_batch_size = 96
 # It's been changed s.t. the user now fixes effective_batch_size to a number they deem reasonable for clean gradients and batch_size to ensure training is as performant as possible
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
-batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-# batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -216,16 +200,14 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-if (is_streaming):
-    data_dir = dataset
-else:
-    data_dir = os.path.join(os.getcwd(), dataset)
+data_dir = os.path.join(os.getcwd(), dataset)
 # batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type)
-batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type, streaming=is_streaming, streaming_config_name=streaming_config)
-
+# batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type, dataset_config_name='dataloader_confg.json')
+# batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type, dataset_config_name=loader_config_name, async_pool_builder=loader_async_pool, pool_size_bytes=pool_size*1024**3)
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+data_loader_args = None
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -241,7 +223,9 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     checkpoint_file_path = args.chpr
     print(f"Resuming from a checkpoint:{checkpoint_file_path}")
-    model, model_sd, opt_args, opt_sd, iter_num = train_helper.CreateModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
+    model, model_sd, opt_args, opt_sd, iter_num, other_args = train_helper.CreateModel(model_folder_name, checkpoint_file_path, None, from_scratch=False)
+    data_loader_args = other_args[0]
+
     if (overwrite_optimizer):
         print("Using new optimizer args instead of those defined in the checkpoint.")
         opt_args = parsed_opt_args
@@ -260,16 +244,26 @@ elif init_from == 'resume':
 else:
     raise ValueError("Unknown input for --type")
 
+# batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type, dataset_config_name=loader_config_name, async_pool_builder=loader_async_pool, pool_size_bytes=pool_size)
+# if (not data_loader_args is None):
+#     batch_helper.load_state_dict(data_loader_args, strict=True)
+
+if (not data_loader_args is None):
+    batch_helper = th_loader.BatchHelper.from_state_dict(
+        data_loader_args[0],
+        strict=False,
+        device=device,
+        device_type=device_type,
+    )
+else:
+    batch_helper = th_loader.BatchHelper(block_size, batch_size, data_dir, device, device_type, dataset_config_name=loader_config_name, async_pool_builder=loader_async_pool, pool_size_bytes=pool_size)
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 # scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
 if hasattr(torch.amp, "GradScaler"):
     scaler = torch.amp.GradScaler("cuda", enabled=(dtype == "float16"))
 else:
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -327,10 +321,11 @@ def get_lr(it):
     return LR_RETURN
 
 # training loop
+print("Fetching initial data")
 X, Y = batch_helper.get_batch('train') # fetch the very first batch
 t0 = time.time()
-local_iter_num = iter_num # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
+local_iter_num = iter_num # number of iterations in the lifetime of this process
 running_mfu = -1.0
 
 model_checkpoint_path = model.getCheckpointPath()
@@ -422,7 +417,7 @@ while True:
         print(f"Current val loss: {losses['val']:.4f}")
 
         current_checkpoints = len(os.listdir(model_checkpoint_path))
-
+        
         if current_checkpoints >= max_checkpoints_to_keep:
             def _checkpoint_iter_num(filename):
                 match = re.search(r"ITER0*(\d+)", filename)
@@ -432,20 +427,22 @@ while True:
                     )
                 return int(match.group(1))
 
-            files = [
-                f for f in os.listdir(model_checkpoint_path)
-                if os.path.isfile(os.path.join(model_checkpoint_path, f))
-            ]
+            # Remove 2 files to get rid of the checkpoint and it's .ptd file
+            for idx in range(2):
+                files = [
+                    f for f in os.listdir(model_checkpoint_path)
+                    if os.path.isfile(os.path.join(model_checkpoint_path, f))
+                ]
 
-            chkpt_to_remove = os.path.join(
-                model_checkpoint_path,
-                min(files, key=_checkpoint_iter_num),
-            )
+                chkpt_to_remove = os.path.join(
+                    model_checkpoint_path,
+                    min(files, key=_checkpoint_iter_num),
+                )
 
-            print(f"Removing checkpoint: {chkpt_to_remove}")
-            os.remove(chkpt_to_remove)
+                print(f"Removing checkpoint: {chkpt_to_remove}")
+                os.remove(chkpt_to_remove)
 
-        model.saveCheckpoint(optimizer, losses["val"], iter_num)
+        model.saveCheckpoint(optimizer, losses["val"], iter_num, batch_helper)
 
         with open(os.path.join(model_path, "training_data.txt"), mode="a") as f:
             f.write(
@@ -541,7 +538,7 @@ while True:
             print(f"Removing checkpoint: {chkpt_to_remove}")
             os.remove(chkpt_to_remove)
 
-        model.saveCheckpoint(optimizer, lossf, iter_num)
+        model.saveCheckpoint(optimizer, lossf, iter_num, batch_helper)
 
     iter_num += 1
     local_iter_num += 1

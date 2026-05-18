@@ -6,6 +6,8 @@ from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 import torch
 import inspect
 
+from train_helper_loader import BatchHelper
+
 param_file_name = "training_model_params.json"
 METADATA_KEYS = ["author"]
 
@@ -37,10 +39,9 @@ def CreateModel(model_folder_name:str, checkpoint_file_path:str=None, chkpt_fold
                 raise ValueError("Checkpoint name cannot be none if not creating from scratch.\n")
         except:
                 raise ValueError("Checkpoint name cannot be none if not creating from scratch.\n")
-        gpt_model, model_sd, opt_args, opt_sd, iter_num = model.loadFromCheckpoint(model_folder_name, checkpoint_file_path)
-        return gpt_model, model_sd, opt_args, opt_sd, iter_num
+        gpt_model, model_sd, opt_args, opt_sd, iter_num, other_args = model.loadFromCheckpoint(model_folder_name, checkpoint_file_path, BatchHelper)
+        return gpt_model, model_sd, opt_args, opt_sd, iter_num, other_args
     
-# def CreateOptimizer(param_groups, type='muon', device_type='cpu'):
 def CreateOptimizer(args=None):
     if (args is None):
         raise ValueError("Invalid args passed to CreateOptimizer")

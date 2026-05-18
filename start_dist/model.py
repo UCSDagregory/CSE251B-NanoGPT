@@ -337,7 +337,7 @@ class nanoGPT(nn.Module):
     def getCheckpointPath(self):
         return os.path.join(self.model_path, self.checkpoint_folder_name)
 
-    def saveCheckpoint(self, optimizer: nn.Module, val_loss: int, iter_num: int, non_eval_checkpoint=False):
+    def saveCheckpoint(self, optimizer: nn.Module, val_loss: int, iter_num: int, batch_helper, non_eval_checkpoint=False):
         checkpoint = {
             MODEL_CONFIG: {
                 "author": self.author,
@@ -396,6 +396,11 @@ class nanoGPT(nn.Module):
         full_checkpoint_path = os.path.join(self.getCheckpointPath(), save_file_name)
         os.makedirs(os.path.dirname(full_checkpoint_path), exist_ok=True)
         torch.save(checkpoint, full_checkpoint_path)
+        if batch_helper is not None:
+            batch_helper.save_checkpoint_sidecar(
+                full_checkpoint_path,
+                wait_for_builder=False,
+            )
 
     def configure_optimizers(self, args):
         print(args)
@@ -570,7 +575,7 @@ def getArgs(checkpoint, model_folder_name="N/A", chkpt_folder_name="N/A", resume
     return model_args, opt_args
 
 
-def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str) -> tuple[nn.Module, Any, Any, Any, int]:
+def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str, BatchHelper=None) -> tuple[nn.Module, Any, Any, Any, int, list|None]:
     split_path = checkpoint_file_path.split("/")
 
     if len(split_path) != 2:
@@ -591,7 +596,10 @@ def loadFromCheckpoint(model_folder_name: str, checkpoint_file_path: str) -> tup
 
     checkpoint = None
 
-    return gpt_model, model_sd, opt_args, opt_sd, iter_num
+    dataloader_items = BatchHelper.load_checkpoint_sidecar_items(load_path)
+    
+    other_args = [dataloader_items]
+    return gpt_model, model_sd, opt_args, opt_sd, iter_num, other_args
 
 
 def load_model(checkpoint_path: str, device: str = "cuda") -> torch.nn.Module:
