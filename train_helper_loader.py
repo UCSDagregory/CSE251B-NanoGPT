@@ -251,6 +251,7 @@ class HFBinSource(SourceBackend):
         self.current_file_size_bytes: Optional[int] = None
         self.current_token_offset = 0
         self.rng = random.Random(int(cfg.get("seed", 1234)))
+        self.heartbeat_interval_seconds = max(1.0, float(cfg.get("heartbeat_interval_seconds", cfg.get("heartbeat_interval", 30.0))))
         self._active_source_path: Optional[Path] = None
 
     def next_token_chunk(self, target_tokens: int) -> TokenChunk:
@@ -388,7 +389,16 @@ class HFBinSource(SourceBackend):
             raise ImportError("hf_bin requires huggingface_hub") from e
         local_dir = self._repo_cache_dir()
         local_dir.mkdir(parents=True, exist_ok=True)
-        return hf_hub_download(
+        t0 = _now()
+        self.logger.info(
+            "hf_bin heartbeat source=%s action=ensure_cached repo=%s file=%s size=%s revision=%s",
+            self.name,
+            self.repo_id,
+            self.current_file,
+            self.current_file_size_bytes,
+            self.revision,
+        )
+        path = hf_hub_download(
             repo_id=self.repo_id,
             filename=self.current_file,
             repo_type=self.repo_type,
@@ -396,6 +406,20 @@ class HFBinSource(SourceBackend):
             token=self.hf_token,
             local_dir=str(local_dir),
         )
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            size = None
+        self.logger.info(
+            "hf_bin heartbeat source=%s action=cached repo=%s file=%s elapsed=%.1fs path=%s bytes=%s",
+            self.name,
+            self.repo_id,
+            self.current_file,
+            _now() - t0,
+            path,
+            size,
+        )
+        return path
 
     def _repo_cache_dir(self) -> Path:
         revision = self.revision or "default"
@@ -700,6 +724,7 @@ class HFRawTextSource(SourceBackend):
         self.streaming = bool(cfg.get("streaming", True))
         self.fail_fast = bool(cfg.get("fail_fast", True))
         self.prefetch_batches = int(cfg.get("prefetch_batches", cfg.get("raw_prefetch_batches_per_source", 8)))
+        self.heartbeat_interval_seconds = max(1.0, float(cfg.get("heartbeat_interval_seconds", cfg.get("heartbeat_interval", 30.0))))
         self.exhaustion_policy = "repeat"
         self.raw_manager = raw_manager
         self.token_queue = raw_manager.register_source(self.name)
@@ -747,9 +772,24 @@ class HFRawTextSource(SourceBackend):
         if self.hf_token:
             kwargs["token"] = self.hf_token
         t0 = _now()
+        self.logger.info(
+            "hf_raw_text heartbeat source=%s action=load_dataset_start dataset=%s config=%s split=%s epoch=%d",
+            self.name,
+            self.dataset,
+            self.dataset_config,
+            self.split,
+            self.source_epoch,
+        )
         ds = load_dataset(**kwargs)
-        self.load_dataset_seconds_total += _now() - t0
+        elapsed = _now() - t0
+        self.load_dataset_seconds_total += elapsed
         self.load_dataset_calls += 1
+        self.logger.info(
+            "hf_raw_text heartbeat source=%s action=load_dataset_done elapsed=%.1fs calls=%d",
+            self.name,
+            elapsed,
+            self.load_dataset_calls,
+        )
         if self.shuffle_buffer > 0:
             ds = ds.shuffle(seed=self.seed + self.source_epoch, buffer_size=self.shuffle_buffer)
         self._dataset_obj = ds
@@ -825,6 +865,9 @@ class HFRawTextSource(SourceBackend):
         first_epoch: Optional[int] = None
         last_epoch: Optional[int] = None
         token_count = 0
+        chunk_start_time = _now()
+        last_heartbeat = chunk_start_time
+        queue_empty_count = 0
         while token_count < target_tokens or not arrays:
             if self.errors and self.fail_fast:
                 raise RuntimeError(f"Raw source {self.name} has errors: {self.errors[-3:]}")
@@ -836,8 +879,19 @@ class HFRawTextSource(SourceBackend):
             try:
                 item = self.raw_manager.get_tokenized(self.name, timeout=0.25)
             except queue.Empty:
+                queue_empty_count += 1
                 # Keep the pipeline fed for the selected source only.
                 self._read_next_raw_batch_and_submit()
+                now = _now()
+                if now - last_heartbeat >= self.heartbeat_interval_seconds:
+                    self.logger.info(
+                        "hf_raw_text heartbeat source=%s action=waiting_for_tokens target=%d collected=%d elapsed=%.1fs epoch=%d examples_read=%d examples_emitted=%d raw_batches=%d token_batches=%d inflight=%d source_token_q=%d raw_q_items=%d raw_q_gib=%.2f manager_errors=%d queue_empty=%d",
+                        self.name, target_tokens, token_count, now - chunk_start_time, self.source_epoch,
+                        self.examples_read, self.examples_emitted, self.raw_batches, self.token_batches,
+                        self._inflight_batches, self.token_queue.qsize(), self.raw_manager.raw_queue.current_items,
+                        self.raw_manager.raw_queue.current_bytes / (1024**3), len(self.raw_manager.errors), queue_empty_count,
+                    )
+                    last_heartbeat = now
                 continue
             if item is STOP:
                 continue
@@ -853,6 +907,16 @@ class HFRawTextSource(SourceBackend):
             last_idx = max(last_idx, item.last_example_index)
             first_epoch = item.source_epoch if first_epoch is None else min(first_epoch, item.source_epoch)
             last_epoch = item.source_epoch if last_epoch is None else max(last_epoch, item.source_epoch)
+            now = _now()
+            if now - last_heartbeat >= self.heartbeat_interval_seconds:
+                self.logger.info(
+                    "hf_raw_text heartbeat source=%s action=collecting_tokens target=%d collected=%d pct=%.2f elapsed=%.1fs epoch=%d examples_read=%d examples_emitted=%d raw_batches=%d token_batches=%d inflight=%d source_token_q=%d raw_q_items=%d raw_q_gib=%.2f",
+                    self.name, target_tokens, token_count, 100.0 * min(1.0, token_count / max(1, target_tokens)), now - chunk_start_time,
+                    self.source_epoch, self.examples_read, self.examples_emitted, self.raw_batches, self.token_batches,
+                    self._inflight_batches, self.token_queue.qsize(), self.raw_manager.raw_queue.current_items,
+                    self.raw_manager.raw_queue.current_bytes / (1024**3),
+                )
+                last_heartbeat = now
 
         flat: List[int] = []
         for a in arrays:
@@ -862,6 +926,10 @@ class HFRawTextSource(SourceBackend):
         self.examples_emitted += examples
         self.raw_bytes_emitted += raw_bytes
         self.last_example_index_emitted = max(self.last_example_index_emitted, last_idx)
+        self.logger.info(
+            "hf_raw_text heartbeat source=%s action=chunk_ready tokens=%d target=%d elapsed=%.1fs examples=%d raw_bytes=%d epoch_start=%s epoch_end=%s",
+            self.name, int(token_np.size), target_tokens, _now() - chunk_start_time, examples, raw_bytes, first_epoch, last_epoch,
+        )
         return TokenChunk(
             tokens=token_np,
             source_name=self.name,
@@ -968,6 +1036,7 @@ class BatchHelper:
         raw_queue_max_batches: int = 256,
         raw_token_queue_max_batches: int = 64,
         raw_tokenizer_workers: str | int = "auto",
+        heartbeat_interval_seconds: float = 30.0,
         data_log_path: Optional[str | os.PathLike[str]] = None,
         data_log_max_bytes: int = 10_000_000,
         data_log_backup_count: int = 5,
@@ -1013,6 +1082,7 @@ class BatchHelper:
         self.raw_queue_max_batches = int(raw_queue_max_batches)
         self.raw_token_queue_max_batches = int(raw_token_queue_max_batches)
         self.raw_tokenizer_workers = _auto_tokenizer_workers() if str(raw_tokenizer_workers) == "auto" else max(1, int(raw_tokenizer_workers))
+        self.heartbeat_interval_seconds = max(1.0, float(heartbeat_interval_seconds))
         self.raw_manager: Optional[RawTextManager] = None
         self.data_log_path = Path(data_log_path) if data_log_path is not None else self.class_dir / "pool_builder.log"
         self.data_log_max_bytes = int(data_log_max_bytes)
@@ -1104,12 +1174,17 @@ class BatchHelper:
         if "tokenizer_workers" in rb:
             tw = rb["tokenizer_workers"]
             self.raw_tokenizer_workers = _auto_tokenizer_workers() if str(tw) == "auto" else max(1, int(tw))
+        if "heartbeat_interval_seconds" in rb:
+            self.heartbeat_interval_seconds = max(1.0, float(rb["heartbeat_interval_seconds"]))
+        elif "heartbeat_interval" in rb:
+            self.heartbeat_interval_seconds = max(1.0, float(rb["heartbeat_interval"]))
         self.logger.info(
-            "Configured global raw backend raw_buffer_bytes=%d raw_queue_max_batches=%d token_queue_max_batches=%d tokenizer_workers=%d",
+            "Configured global raw backend raw_buffer_bytes=%d raw_queue_max_batches=%d token_queue_max_batches=%d tokenizer_workers=%d heartbeat_interval=%.1fs",
             self.raw_buffer_bytes,
             self.raw_queue_max_batches,
             self.raw_token_queue_max_batches,
             self.raw_tokenizer_workers,
+            self.heartbeat_interval_seconds,
         )
 
     def _build_sources(self, config: Dict[str, Any]) -> List[SourceBackend]:
@@ -1121,6 +1196,7 @@ class BatchHelper:
             cfg = dict(raw)
             backend = cfg.get("backend", "hf_bin")
             cfg.setdefault("name", cfg.get("repo_id") or cfg.get("dataset") or f"source_{idx}")
+            cfg.setdefault("heartbeat_interval_seconds", self.heartbeat_interval_seconds)
             if backend == "hf_bin":
                 sources.append(HFBinSource(
                     cfg,
@@ -1298,7 +1374,9 @@ class BatchHelper:
         total_tokens = 0
         segments: List[Dict[str, Any]] = []
         actual_by_source = {s.name: 0 for s in self.sources}
-        self.logger.info("Building reserve generation=%d target_tokens=%d sources=%d", generation, target_tokens, len(self.sources))
+        build_start_time = _now()
+        last_build_heartbeat = build_start_time
+        self.logger.info("Building reserve generation=%d target_tokens=%d sources=%d heartbeat_interval=%.1fs", generation, target_tokens, len(self.sources), self.heartbeat_interval_seconds)
 
         try:
             with self.reserve_tmp_path.open("wb") as out:
@@ -1324,6 +1402,15 @@ class BatchHelper:
                         "backend": chunk.backend,
                         "metadata": chunk.metadata,
                     })
+                    now = _now()
+                    if now - last_build_heartbeat >= self.heartbeat_interval_seconds:
+                        elapsed = now - build_start_time
+                        self.logger.info(
+                            "reserve heartbeat generation=%d tokens=%d/%d pct=%.2f elapsed=%.1fs rate_tokens_per_s=%.0f current_source=%s backend=%s segments=%d actual_by_source=%s",
+                            generation, total_tokens, target_tokens, 100.0 * total_tokens / max(1, target_tokens), elapsed,
+                            total_tokens / max(1e-9, elapsed), chunk.source_name, chunk.backend, len(segments), actual_by_source,
+                        )
+                        last_build_heartbeat = now
                 out.flush(); os.fsync(out.fileno())
 
             if total_tokens <= self.block_size:
@@ -1457,6 +1544,7 @@ class BatchHelper:
             "raw_queue_max_batches": self.raw_queue_max_batches,
             "raw_token_queue_max_batches": self.raw_token_queue_max_batches,
             "raw_tokenizer_workers": self.raw_tokenizer_workers,
+            "heartbeat_interval_seconds": self.heartbeat_interval_seconds,
             "data_log_path": str(self.data_log_path),
             "data_log_max_bytes": self.data_log_max_bytes, "data_log_backup_count": self.data_log_backup_count,
             "data_log_to_console": self.data_log_to_console, "disable_hf_progress": self.disable_hf_progress,
