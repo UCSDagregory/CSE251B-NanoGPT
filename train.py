@@ -111,8 +111,7 @@ iters_per_checkpoint = -1
 max_checkpoints_to_keep = 4 
 
 dataset = args.data_fd_name
-# effective_batch_size = 96
-effective_batch_size = 1
+effective_batch_size = 96
 # Important note
 # batch_size exists to be memory efficient, if there isn't enough space in the GPU memory it will spill over into SMEM (shared memory)
 # which is significantly slower than it just living in VRAM
@@ -127,9 +126,9 @@ effective_batch_size = 1
 # It's been changed s.t. the user now fixes effective_batch_size to a number they deem reasonable for clean gradients and batch_size to ensure training is as performant as possible
 # gradient_accumulation_steps (micro batches) are now calculated from the two. The main issue is it's possible to construct non-evenly divisible batches so we simply round up
 
-# batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = int(float(effective_batch_size)/float(batch_size)) # used to simulate larger batch sizes
 remainder = effective_batch_size%batch_size
 if (remainder > 0):
@@ -144,8 +143,6 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-# warmup_iters = 200 # how many steps to warm up for
-# warmup_iters = 10 # how many steps to warm up for
 warmup_iters = max(25,int(0.05*float(max_iters))) # how many steps to warm up for
 lr_decay_iters = int(max_iters*1.0) # should be ~= max_iters per Chinchilla
 min_lr = []
