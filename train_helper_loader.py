@@ -630,10 +630,13 @@ class RawTextManager:
                 eot = eot_cache[encoding_name]
                 if append_eot and eot is None:
                     raise ValueError(f"append_eot=True but tokenizer {encoding_name!r} has no eot_token")
-                if hasattr(enc, "encode_ordinary_batch"):
-                    token_arrays = enc.encode_ordinary_batch(item.texts, num_threads=1)
-                else:
-                    token_arrays = [enc.encode_ordinary(t) for t in item.texts]
+                # Do not call encode_ordinary_batch() inside these worker threads.
+                # tiktoken's batch API creates/schedules its own internal futures;
+                # during shutdown that can raise "cannot schedule new futures after
+                # interpreter shutdown", and during normal operation it creates
+                # nested thread pools on top of our global tokenizer worker pool.
+                # The global RawTextManager workers already provide parallelism.
+                token_arrays = [enc.encode_ordinary(t) for t in item.texts]
                 if append_eot:
                     token_arrays = [list(a) + [int(eot)] for a in token_arrays]
                 else:
@@ -652,14 +655,25 @@ class RawTextManager:
                 ))
                 self.token_batches_produced += 1
             except Exception as e:
+                # If Python is already shutting down, tokenizer failures are
+                # teardown noise, not a data/read/tokenization failure that should
+                # corrupt the committed loader state.
+                if sys.is_finalizing() or "interpreter shutdown" in str(e):
+                    self.logger.warning(
+                        "RawTextManager tokenizer stopped during interpreter shutdown worker=%d source=%s error=%r",
+                        worker_id,
+                        getattr(item, "source_name", None),
+                        e,
+                    )
+                    break
                 msg = f"worker {worker_id}: {e!r}"
                 self.errors.append(msg)
                 self.logger.exception("RawTextManager tokenizer failed worker=%d source=%s", worker_id, getattr(item, "source_name", None))
                 if self.fail_fast:
-                    self.close()
+                    self.close(wait=False)
                     break
 
-    def close(self) -> None:
+    def close(self, *, wait: bool = False, timeout: float = 5.0) -> None:
         with self._lock:
             self._closed = True
             self.raw_queue.close()
@@ -668,6 +682,11 @@ class RawTextManager:
                     q.put_nowait(STOP)
                 except Exception:
                     pass
+        if wait:
+            current = threading.current_thread()
+            for t in list(self._threads):
+                if t is not current and t.is_alive():
+                    t.join(timeout=timeout)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -1685,7 +1704,7 @@ class BatchHelper:
     def close(self, *, wait: bool = False) -> None:
         for s in self.sources: s.close()
         if self.raw_manager is not None:
-            self.raw_manager.close()
+            self.raw_manager.close(wait=wait)
         if self._executor is not None:
             self._executor.shutdown(wait=wait, cancel_futures=not wait)
             self._executor = None; self._builder_future = None
