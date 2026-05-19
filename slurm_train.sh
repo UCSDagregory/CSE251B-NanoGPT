@@ -101,7 +101,8 @@ if timeout 12h python "$REPO/train.py" \
   --type resume \
   --folder start_dist \
   --data_fd_name "$REPO/data/mixed-data" \
-  --chpr checkpoints/ITER00033000_003.2923val_loss_nanoGPT_DaginGregory.pt
+  --chpr checkpoints/ITER00045000_003.1879val_loss_nanoGPT_DaginGregory.pt \
+  --loader_cfg_name stress_config.json
 then
     echo "Training finished before timeout."
 else

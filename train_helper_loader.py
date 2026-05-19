@@ -714,6 +714,11 @@ class HFRawTextSource(SourceBackend):
         self.split = cfg.get("split", "train")
         self.text_column = cfg.get("text_column", "text")
         self.hf_token = hf_token
+        # Some HF datasets use custom dataset loading code and require
+        # trust_remote_code=True. Keep it source-local so only explicitly
+        # trusted datasets execute remote code.
+        self.trust_remote_code = cfg.get("trust_remote_code", None)
+        self.load_dataset_kwargs = dict(cfg.get("load_dataset_kwargs", {}))
         self.tokenizer_encoding = cfg.get("tokenizer") or cfg.get("tokenizer_encoding", "gpt2")
         self.append_eot = bool(cfg.get("append_eot", True))
         self.shuffle_buffer = int(cfg.get("shuffle_buffer", 0))
@@ -766,21 +771,57 @@ class HFRawTextSource(SourceBackend):
 
     def _open_iterator(self) -> None:
         from datasets import load_dataset
+
         kwargs: Dict[str, Any] = {"path": self.dataset, "split": self.split, "streaming": self.streaming}
         if self.dataset_config:
             kwargs["name"] = self.dataset_config
         if self.hf_token:
             kwargs["token"] = self.hf_token
+        if self.trust_remote_code is not None:
+            kwargs["trust_remote_code"] = bool(self.trust_remote_code)
+
+        # Allow advanced per-source HF datasets options without changing loader code,
+        # but do not allow them to silently override the core source identity fields.
+        reserved = {"path", "name", "split", "streaming", "token"}
+        bad_keys = sorted(k for k in self.load_dataset_kwargs if k in reserved)
+        if bad_keys:
+            raise ValueError(
+                f"hf_raw_text source {self.name!r} load_dataset_kwargs may not override reserved keys {bad_keys}. "
+                "Use the top-level source fields dataset/dataset_config/split/streaming instead."
+            )
+        kwargs.update(self.load_dataset_kwargs)
+
         t0 = _now()
         self.logger.info(
-            "hf_raw_text heartbeat source=%s action=load_dataset_start dataset=%s config=%s split=%s epoch=%d",
+            "hf_raw_text heartbeat source=%s action=load_dataset_start dataset=%s config=%s split=%s epoch=%d trust_remote_code=%s extra_kwargs=%s",
             self.name,
             self.dataset,
             self.dataset_config,
             self.split,
             self.source_epoch,
+            kwargs.get("trust_remote_code", None),
+            sorted(self.load_dataset_kwargs.keys()),
         )
-        ds = load_dataset(**kwargs)
+        try:
+            ds = load_dataset(**kwargs)
+        except ValueError as e:
+            msg = str(e)
+            if "trust_remote_code" in msg:
+                raise RuntimeError(
+                    f"hf_raw_text source {self.name!r} failed to load dataset {self.dataset!r}. "
+                    "This dataset appears to require custom Hugging Face dataset code. "
+                    "If you trust this dataset repository, add trust_remote_code=true "
+                    "to this source config. Original error: " + msg
+                ) from e
+            raise RuntimeError(
+                f"hf_raw_text source {self.name!r} failed in load_dataset(dataset={self.dataset!r}, "
+                f"config={self.dataset_config!r}, split={self.split!r}). Original error: {msg}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"hf_raw_text source {self.name!r} failed in load_dataset(dataset={self.dataset!r}, "
+                f"config={self.dataset_config!r}, split={self.split!r}). Original error: {e!r}"
+            ) from e
         elapsed = _now() - t0
         self.load_dataset_seconds_total += elapsed
         self.load_dataset_calls += 1
@@ -966,6 +1007,8 @@ class HFRawTextSource(SourceBackend):
             "dataset_config": self.dataset_config,
             "split": self.split,
             "text_column": self.text_column,
+            "trust_remote_code": self.trust_remote_code,
+            "load_dataset_kwargs": dict(self.load_dataset_kwargs),
             "tokenizer_encoding": self.tokenizer_encoding,
             "append_eot": self.append_eot,
             "shuffle_buffer": self.shuffle_buffer,
@@ -1000,6 +1043,8 @@ class HFRawTextSource(SourceBackend):
         self.raw_bytes_emitted = int(state.get("raw_bytes_emitted", 0))
         self.last_example_index_read = int(state.get("last_example_index_read", -1))
         self.last_example_index_emitted = int(state.get("last_example_index_emitted", -1))
+        self.trust_remote_code = state.get("trust_remote_code", self.trust_remote_code)
+        self.load_dataset_kwargs = dict(state.get("load_dataset_kwargs", self.load_dataset_kwargs))
         self.load_dataset_seconds_total = float(state.get("load_dataset_seconds_total", 0.0))
         self.load_dataset_calls = int(state.get("load_dataset_calls", 0))
 

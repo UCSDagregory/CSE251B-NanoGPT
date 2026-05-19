@@ -100,7 +100,8 @@ parsed_opt_args = parseOptParams(opt_path)
 if (LEARNING_RATE is None):
     raise ValueError("Something went wrong when parsing the optimizer.json, couldn't extract a valid learning rate.")
 
-eval_interval = 500 # How many iters until re-calculate val. loss
+eval_interval = 1000 # How many iters until re-calculate val. loss
+# eval_interval = 500 # How many iters until re-calculate val. loss
 # eval_interval = 1 # How many iters until re-calculate val. loss
 log_interval = 1
 eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
@@ -108,7 +109,7 @@ eval_iters = 25 # How many times to calculate val.loss per 'eval interval'
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 iters_per_checkpoint = -1
-max_checkpoints_to_keep = 4 
+max_checkpoints_to_keep = 2*(4) 
 
 dataset = args.data_fd_name
 effective_batch_size = 96

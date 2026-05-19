@@ -3,70 +3,50 @@
     "global_raw_buffer_bytes": "10GiB",
     "raw_queue_max_batches": 256,
     "global_token_queue_max_batches": 64,
-    "tokenizer_workers": 6
+    "tokenizer_workers": 6,
+    "heartbeat_interval_seconds": 30
   },
   "sources": [
     {
       "backend": "hf_bin",
-      "name": "ginger_mixed_data_7030",
+      "name": "known_good_wiki_correction_anchor",
       "repo_id": "123Ginger321/mixed-data",
       "revision": "7030",
-      "weight": 0.31
+      "weight": 0.55
     },
     {
       "backend": "hf_raw_text",
-      "name": "fineweb_edu_sample_10bt",
-      "dataset": "HuggingFaceFW/fineweb-edu",
-      "dataset_config": "sample-10BT",
+      "name": "pg19_book_history",
+      "dataset": "emozilla/pg19",
+      "dataset_config": "default",
       "split": "train",
       "text_column": "text",
       "tokenizer": "gpt2",
       "append_eot": true,
-      "weight": 0.23
+      "weight": 0.3
     },
     {
       "backend": "hf_raw_text",
-      "name": "fineweb_sample_10bt",
-      "dataset": "HuggingFaceFW/fineweb",
-      "dataset_config": "sample-10BT",
-      "split": "train",
-      "text_column": "text",
-      "tokenizer": "gpt2",
-      "append_eot": true,
-      "weight": 0.17
-    },
-    {
-      "backend": "hf_raw_text",
-      "name": "openwebtext",
-      "dataset": "Skylion007/openwebtext",
-      "dataset_config": "plain_text",
-      "split": "train",
-      "text_column": "text",
-      "tokenizer": "gpt2",
-      "append_eot": true,
-      "weight": 0.13
-    },
-    {
-      "backend": "hf_raw_text",
-      "name": "wikitext_103_raw",
-      "dataset": "Salesforce/wikitext",
-      "dataset_config": "wikitext-103-raw-v1",
-      "split": "train",
-      "text_column": "text",
-      "tokenizer": "gpt2",
-      "append_eot": true,
-      "weight": 0.10
-    },
-    {
-      "backend": "hf_raw_text",
-      "name": "wikipedia_20231101_en",
+      "name": "simple_wikipedia_reference",
       "dataset": "wikimedia/wikipedia",
-      "dataset_config": "20231101.en",
+      "dataset_config": "20231101.simple",
       "split": "train",
       "text_column": "text",
       "tokenizer": "gpt2",
       "append_eot": true,
-      "weight": 0.06
+      "weight": 0.14
+    },
+    {
+      "backend": "hf_raw_text",
+      "name": "pile_of_law_legal_gov",
+      "dataset": "pile-of-law/pile-of-law",
+      "dataset_config": "all",
+      "split": "train",
+      "text_column": "text",
+      "tokenizer": "gpt2",
+      "append_eot": true,
+      "trust_remote_code": true,
+      "weight": 0.01
     }
   ]
 }
