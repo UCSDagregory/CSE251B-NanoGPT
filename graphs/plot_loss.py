@@ -10,8 +10,9 @@ data_sources = {
     #"10M MoE Shallow": "../../training_data/10m_moe_shallow.txt",
     #"10M MoE Sparse": "../../training_data/10m_moe_sparse.txt",
     #"10M MoE Dense": "../../training_data/10m_moe_dense.txt",
-    "90M MoE Control": "../../training_data/90m_moe_control.txt",
-    "90M MoE Dense": "../../training_data/90m_moe_dense.txt"
+    #"90M MoE Control": "../../training_data/90m_moe_control.txt",
+    #"90M MoE Dense": "../../training_data/90m_moe_dense.txt"
+    "100M MoE Dense": "../my_model/training_data.txt"
 }
 
 # Set up the figure size (Standard academic ratio)
@@ -56,7 +57,7 @@ plt.legend(fontsize=11)
 plt.tight_layout()
 
 # 4. Save as a high-quality PDF for LaTeX!
-save_path = "30m_moe_loss_curve.pdf"
+save_path = "100m_moe_loss_curve.pdf"
 plt.savefig(save_path, format="pdf", bbox_inches="tight")
 print(f"Graph successfully saved to {save_path}")
 
