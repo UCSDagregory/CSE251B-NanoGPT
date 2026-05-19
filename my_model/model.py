@@ -192,9 +192,6 @@ class nanoGPT(nn.Module):
         self.lm_head.weight = self.token_emb.weight
 
         self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
 
         self.num_parameters = sum(val.numel() for val in self.parameters())
         self.author = author
