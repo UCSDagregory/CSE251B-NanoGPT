@@ -178,6 +178,10 @@ class RawTextBatch:
     source_epoch: int = 0
     tokenizer_encoding: str = "gpt2"
     append_eot: bool = True
+    # Optional per-text EOT flags. This is used when one accepted long
+    # document is split into many tokenizer chunks; only the final chunk
+    # should receive EOT so chunking does not alter document boundaries.
+    append_eot_flags: Optional[List[bool]] = None
 
 
 @dataclass
@@ -255,6 +259,16 @@ class HistoryEntityDenseV1Filter(TextFilter):
         "table of contents", "contents", "index", "list of illustrations",
         "list of plates", "bibliography", "catalogue",
     )
+    DEFAULT_NEGATIVE_TERMS = (
+        # PG19 contains many books that look entity-dense by capitalization but
+        # are not the factual/history/reference prose we want. These terms are
+        # strong negative signals, especially when combined with low year count.
+        "my secret life", "private distribution", "privately printed",
+        "subscribers", "connoisseur", "connoisseurs", "mistress",
+        "lover", "beloved", "desire", "passion", "bosom", "kiss",
+        "seduction", "amorous", "voluptuous", "sensual", "courtesan",
+        "romance", "anonymous",
+    )
 
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__(cfg)
@@ -271,6 +285,12 @@ class HistoryEntityDenseV1Filter(TextFilter):
         self.reject_boilerplate = bool(cfg.get("reject_boilerplate", True))
         self.reject_poetry_or_play_format = bool(cfg.get("reject_poetry_or_play_format", True))
         self.reject_table_index_heavy = bool(cfg.get("reject_table_index_heavy", True))
+        self.require_fact_signal = bool(cfg.get("require_fact_signal", True))
+        self.require_entity_and_fact_signal = bool(cfg.get("require_entity_and_fact_signal", False))
+        self.strong_history_term_count = int(cfg.get("strong_history_term_count", max(12, self.min_history_term_count)))
+        self.negative_term_reject_threshold = int(cfg.get("negative_term_reject_threshold", 2))
+        negative_terms = cfg.get("negative_terms") or self.DEFAULT_NEGATIVE_TERMS
+        self.negative_terms = tuple(str(t).lower() for t in negative_terms)
         self.score_threshold = cfg.get("score_threshold", None)
         self.score_threshold = None if self.score_threshold is None else float(self.score_threshold)
         terms = cfg.get("history_terms") or self.DEFAULT_HISTORY_TERMS
@@ -297,6 +317,10 @@ class HistoryEntityDenseV1Filter(TextFilter):
         dot_leader_count = len(self.DOT_LEADER_RE.findall(sample))
         if self.reject_table_index_heavy and (table_index_hits >= 2 or dot_leader_count >= 20):
             return TextFilterResult(False, "table_or_index_heavy", {"table_index_hits": table_index_hits, "dot_leader_count": dot_leader_count})
+
+        negative_hits = sum(1 for term in self.negative_terms if term in lower)
+        if negative_hits >= self.negative_term_reject_threshold:
+            return TextFilterResult(False, "negative_pg19_style_terms", {"negative_hits": negative_hits})
 
         quote_chars = sample.count('"') + sample.count("“") + sample.count("”") + sample.count("'") // 4
         quote_density = quote_chars / sample_chars
@@ -332,17 +356,26 @@ class HistoryEntityDenseV1Filter(TextFilter):
 
         has_entity_signal = entity_like_count >= self.min_entity_like_count
         if self.min_year_count_or_history_terms:
-            has_fact_signal = year_count >= self.min_year_count or history_term_count >= self.min_history_term_count
+            # Entity count alone is too easy for title-cased fiction/PG19 front
+            # matter to inflate. Require real fact/history signal: either enough
+            # years, enough history terms, or a mix of at least one year plus a
+            # meaningful number of history terms.
+            has_fact_signal = (
+                year_count >= self.min_year_count
+                or history_term_count >= self.strong_history_term_count
+                or (year_count >= 1 and history_term_count >= self.min_history_term_count)
+            )
         else:
             has_fact_signal = year_count >= self.min_year_count and history_term_count >= self.min_history_term_count
-        has_number_signal = number_count >= self.min_number_count
+        has_number_signal = self.min_number_count > 0 and number_count >= self.min_number_count
 
         score = (
-            3.0 * year_count
-            + 2.0 * history_term_count
-            + 1.0 * entity_like_count
+            4.0 * year_count
+            + 2.5 * history_term_count
+            + 0.20 * entity_like_count
             + 0.25 * number_count
-            - 20.0 * dialogue_line_ratio
+            - 35.0 * dialogue_line_ratio
+            - 12.0 * negative_hits
             - 10.0 * boilerplate_hits
         )
         metrics = {
@@ -354,6 +387,7 @@ class HistoryEntityDenseV1Filter(TextFilter):
             "year_count": year_count,
             "number_count": number_count,
             "history_term_count": history_term_count,
+            "negative_hits": negative_hits,
             "quote_density": quote_density,
             "dialogue_line_ratio": dialogue_line_ratio,
             "short_line_ratio": short_line_ratio,
@@ -362,6 +396,10 @@ class HistoryEntityDenseV1Filter(TextFilter):
         }
         if self.score_threshold is not None and score < self.score_threshold:
             return TextFilterResult(False, "score_below_threshold", metrics)
+        if self.require_entity_and_fact_signal and not (has_entity_signal and has_fact_signal):
+            return TextFilterResult(False, "missing_required_entity_and_fact_signal", metrics)
+        if self.require_fact_signal and not has_fact_signal:
+            return TextFilterResult(False, "low_year_history_density", metrics)
         if not (has_entity_signal or has_fact_signal or has_number_signal):
             return TextFilterResult(False, "low_entity_date_history_density", metrics)
         return TextFilterResult(True, "accepted_history_entity_dense", metrics)
@@ -823,11 +861,23 @@ class RawTextManager:
                 # interpreter shutdown", and during normal operation it creates
                 # nested thread pools on top of our global tokenizer worker pool.
                 # The global RawTextManager workers already provide parallelism.
-                token_arrays = [enc.encode_ordinary(t) for t in item.texts]
-                if append_eot:
-                    token_arrays = [list(a) + [int(eot)] for a in token_arrays]
+                encoded_arrays = [enc.encode_ordinary(t) for t in item.texts]
+                flags = getattr(item, "append_eot_flags", None)
+                if flags is not None:
+                    if len(flags) != len(encoded_arrays):
+                        raise ValueError(
+                            f"append_eot_flags length {len(flags)} does not match texts length {len(encoded_arrays)}"
+                        )
+                    if any(flags) and eot is None:
+                        raise ValueError(f"append_eot_flags requested EOT but tokenizer {encoding_name!r} has no eot_token")
+                    token_arrays = [
+                        (list(a) + [int(eot)] if flags[i] else list(a))
+                        for i, a in enumerate(encoded_arrays)
+                    ]
+                elif append_eot:
+                    token_arrays = [list(a) + [int(eot)] for a in encoded_arrays]
                 else:
-                    token_arrays = [list(a) for a in token_arrays]
+                    token_arrays = [list(a) for a in encoded_arrays]
 
                 self._token_slots.acquire()
                 q = self.register_source(item.source_name)
@@ -949,6 +999,10 @@ class HFRawTextSource(SourceBackend):
         }
         self.filter_sample_chars = int(cfg.get("filter_sample_chars", 400))
         self.filter_sample_limit = int(cfg.get("filter_sample_limit", 3))
+        # Accepted PG19/book records can be whole books. Split before
+        # tokenization so the global tokenizer pool can parallelize work. EOT is
+        # preserved only on the final chunk of the original document.
+        self.tokenizer_chunk_chars = int(cfg.get("tokenizer_chunk_chars", cfg.get("raw_text_chunk_chars", 200_000)))
         self.exhaustion_policy = "repeat"
         self.raw_manager = raw_manager
         self.token_queue = raw_manager.register_source(self.name)
@@ -1074,7 +1128,7 @@ class HFRawTextSource(SourceBackend):
         samples.append({"reason": reason, "snippet": snippet, "metrics": dict(metrics)})
         self.logger.info(
             "hf_raw_text filter_sample source=%s filter=%s accepted=%s reason=%s snippet=%r metrics=%s",
-            self.name, self.filter_type, accepted, reason, snippet[:240], {k: metrics.get(k) for k in ("entity_like_count", "year_count", "history_term_count", "quote_density", "dialogue_line_ratio", "score") if k in metrics},
+            self.name, self.filter_type, accepted, reason, snippet[:240], {k: metrics.get(k) for k in ("entity_like_count", "year_count", "history_term_count", "negative_hits", "quote_density", "dialogue_line_ratio", "score") if k in metrics},
         )
 
     def _filter_accepts(self, text: str) -> bool:
@@ -1090,12 +1144,47 @@ class HFRawTextSource(SourceBackend):
         self._remember_filter_sample(accepted=False, reason=result.reason, text=text, metrics=result.metrics)
         return False
 
+    def _split_text_for_tokenization(self, text: str) -> List[Tuple[str, bool]]:
+        """Split one accepted raw document into tokenizer-sized chunks.
+
+        Returns (chunk_text, append_eot_for_this_chunk). This preserves the
+        document-level EOT convention while allowing very long books to be
+        tokenized by multiple global workers.
+        """
+        max_chars = int(self.tokenizer_chunk_chars)
+        if max_chars <= 0 or len(text) <= max_chars:
+            return [(text, bool(self.append_eot))]
+
+        chunks: List[str] = []
+        n = len(text)
+        start = 0
+        while start < n:
+            hard_end = min(n, start + max_chars)
+            end = hard_end
+            if hard_end < n:
+                # Prefer paragraph/sentence-ish boundaries near the end of the
+                # chunk without scanning the entire remaining document.
+                window_start = max(start + max_chars // 2, hard_end - max(4096, max_chars // 4))
+                window = text[window_start:hard_end]
+                rel = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind(". "))
+                if rel > 0:
+                    end = window_start + rel + (2 if window[rel:rel+2] == ". " else 1)
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            start = max(end, start + 1)
+
+        if not chunks:
+            return [(text, bool(self.append_eot))]
+        return [(chunk, bool(self.append_eot) and i == len(chunks) - 1) for i, chunk in enumerate(chunks)]
+
     def _read_next_raw_batch_and_submit(self) -> bool:
         if self._closed:
             return False
         if self._iterator is None:
             self._open_iterator()
         texts: List[str] = []
+        append_eot_flags: List[bool] = []
         raw_bytes = 0
         first_idx: Optional[int] = None
         while len(texts) < self.read_batch_examples and raw_bytes < self.read_batch_bytes:
@@ -1126,8 +1215,11 @@ class HFRawTextSource(SourceBackend):
                 continue
             if first_idx is None:
                 first_idx = idx
-            texts.append(text)
-            raw_bytes += b
+            split_chunks = self._split_text_for_tokenization(text)
+            for chunk_text, chunk_append_eot in split_chunks:
+                texts.append(chunk_text)
+                append_eot_flags.append(chunk_append_eot)
+                raw_bytes += len(chunk_text.encode("utf-8", errors="ignore"))
             self.examples_read += 1
             self.raw_bytes_read += b
         if not texts:
@@ -1141,6 +1233,7 @@ class HFRawTextSource(SourceBackend):
             source_epoch=self.source_epoch,
             tokenizer_encoding=self.tokenizer_encoding,
             append_eot=self.append_eot,
+            append_eot_flags=append_eot_flags,
         ), raw_bytes)
         if ok:
             self.raw_batches += 1
@@ -1271,6 +1364,7 @@ class HFRawTextSource(SourceBackend):
             "load_dataset_kwargs": dict(self.load_dataset_kwargs),
             "filter_type": self.filter_type,
             "filter_cfg": dict(self.text_filter_cfg),
+            "tokenizer_chunk_chars": self.tokenizer_chunk_chars,
             "filter_stats": {
                 "records_seen": int(self.filter_stats.get("records_seen", 0)),
                 "records_accepted": int(self.filter_stats.get("records_accepted", 0)),
@@ -1319,6 +1413,8 @@ class HFRawTextSource(SourceBackend):
             self.text_filter_cfg = dict(state.get("filter_cfg") or {})
             self.text_filter = build_text_filter(self.text_filter_cfg)
             self.filter_type = self.text_filter.filter_type
+        if "tokenizer_chunk_chars" in state:
+            self.tokenizer_chunk_chars = int(state.get("tokenizer_chunk_chars") or self.tokenizer_chunk_chars)
         if "filter_stats" in state:
             saved_stats = dict(state.get("filter_stats") or {})
             self.filter_stats.update(saved_stats)
