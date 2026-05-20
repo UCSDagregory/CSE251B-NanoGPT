@@ -212,6 +212,13 @@ class TextFilter(ABC):
     def evaluate(self, text: str) -> TextFilterResult:
         raise NotImplementedError
 
+    def evaluate_record(self, text: str, record: Optional[Dict[str, Any]] = None) -> TextFilterResult:
+        """Evaluate one raw record/chunk.
+
+        Most filters only need text. Metadata-aware filters can override this.
+        """
+        return self.evaluate(text)
+
     def state_dict(self) -> Dict[str, Any]:
         return {"type": self.filter_type, "cfg": dict(self.cfg)}
 
@@ -435,6 +442,224 @@ class HistoryEntityDenseV1Filter(TextFilter):
         return TextFilterResult(True, "accepted_history_entity_dense", metrics)
 
 
+
+class GutenbergHistoryMetadataV1Filter(TextFilter):
+    """Metadata-first Gutenberg filter for history/entity/reference-like books.
+
+    Intended for datasets like sedthh/gutenberg_english where the text body is
+    in TEXT and catalogue metadata is stored as serialized JSON in METADATA.
+    The metadata decides broad genre/topic acceptance; lightweight text checks
+    still reject obvious junk/boilerplate/dialogue/table chunks. If metadata is
+    missing or inconclusive, an optional fallback text filter may be used.
+    """
+
+    filter_type = "gutenberg_history_metadata_v1"
+
+    WORD_RE = HistoryEntityDenseV1Filter.WORD_RE
+    SPEAKER_RE = HistoryEntityDenseV1Filter.SPEAKER_RE
+    DOT_LEADER_RE = HistoryEntityDenseV1Filter.DOT_LEADER_RE
+    BOILERPLATE_TERMS = HistoryEntityDenseV1Filter.BOILERPLATE_TERMS
+    TABLE_INDEX_TERMS = HistoryEntityDenseV1Filter.TABLE_INDEX_TERMS
+    UNICODE_PLACEHOLDER_RE = HistoryEntityDenseV1Filter.UNICODE_PLACEHOLDER_RE
+    GENERIC_BRACE_TILDE_RE = HistoryEntityDenseV1Filter.GENERIC_BRACE_TILDE_RE
+
+    DEFAULT_POSITIVE_METADATA_TERMS = (
+        "history", "biography", "autobiography", "memoir", "politics and government",
+        "political science", "government", "civilization", "war", "military",
+        "campaigns", "battle", "revolution", "colonies", "colonial", "exploration",
+        "description and travel", "travel", "geography", "expeditions", "discovery",
+        "sources", "speeches", "correspondence", "presidents", "kings and rulers",
+        "great britain", "united states", "europe", "rome", "greece", "middle ages",
+    )
+    DEFAULT_POSITIVE_LOCC_PREFIXES = ("D", "E", "F", "G", "J")
+    DEFAULT_NEGATIVE_METADATA_TERMS = (
+        "fiction", "poetry", "drama", "plays", "romance", "love stories",
+        "detective and mystery stories", "adventure stories", "juvenile fiction",
+        "fantasy fiction", "science fiction", "short stories", "fairy tales",
+        "christmas stories",
+    )
+
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__(cfg)
+        self.metadata_column = str(cfg.get("metadata_column", "METADATA"))
+        self.min_chars = int(cfg.get("min_chars", 1000))
+        self.max_filter_chars = int(cfg.get("max_filter_chars", cfg.get("filter_eval_max_chars", 300_000)))
+        self.min_alpha_ratio = float(cfg.get("min_alpha_ratio", 0.45))
+        self.reject_boilerplate = bool(cfg.get("reject_boilerplate", True))
+        self.reject_poetry_or_play_format = bool(cfg.get("reject_poetry_or_play_format", True))
+        self.reject_table_index_heavy = bool(cfg.get("reject_table_index_heavy", True))
+        self.max_quote_density = float(cfg.get("max_quote_density", 0.025))
+        self.max_dialogue_line_ratio = float(cfg.get("max_dialogue_line_ratio", 0.15))
+        self.reject_unicode_placeholder_artifacts = bool(cfg.get("reject_unicode_placeholder_artifacts", True))
+        self.unicode_placeholder_reject_threshold = int(cfg.get("unicode_placeholder_reject_threshold", 8))
+        self.max_brace_tilde_density = float(cfg.get("max_brace_tilde_density", 0.002))
+        self.negative_term_reject_threshold = int(cfg.get("negative_term_reject_threshold", 1))
+        self.positive_metadata_terms = tuple(str(t).lower() for t in (cfg.get("positive_metadata_terms") or self.DEFAULT_POSITIVE_METADATA_TERMS))
+        self.positive_locc_prefixes = tuple(str(t).upper() for t in (cfg.get("positive_locc_prefixes") or self.DEFAULT_POSITIVE_LOCC_PREFIXES))
+        self.negative_metadata_terms = tuple(str(t).lower() for t in (cfg.get("negative_metadata_terms") or self.DEFAULT_NEGATIVE_METADATA_TERMS))
+        self.fallback_to_text_filter = bool(cfg.get("fallback_to_text_filter", True))
+        fallback_cfg = dict(cfg.get("fallback_filter") or {})
+        if not fallback_cfg:
+            fallback_cfg = {"type": "history_entity_dense_v1"}
+        # Prevent accidental recursion if someone nests this same filter.
+        if fallback_cfg.get("type") == self.filter_type:
+            fallback_cfg["type"] = "history_entity_dense_v1"
+        self.fallback_filter = build_text_filter(fallback_cfg) if self.fallback_to_text_filter else None
+
+    def _parse_metadata(self, record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(record, dict):
+            return {}
+        raw = record.get(self.metadata_column)
+        if raw is None:
+            # Try common case-insensitive alternatives.
+            for k, v in record.items():
+                if str(k).lower() == self.metadata_column.lower():
+                    raw = v
+                    break
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not isinstance(raw, str):
+            raw = str(raw)
+        raw = raw.strip()
+        if not raw:
+            return {}
+        try:
+            obj = json.loads(raw)
+            return dict(obj) if isinstance(obj, dict) else {"_raw": raw}
+        except Exception:
+            # Some rows may contain Python-ish/stringified metadata; keep raw text
+            # searchable rather than failing the source.
+            return {"_raw": raw}
+
+    def _metadata_text(self, metadata: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for key in ("title", "authors", "subjects", "bookshelves", "locc", "language", "_raw"):
+            val = metadata.get(key)
+            if val is None:
+                continue
+            if isinstance(val, (list, tuple)):
+                parts.extend(str(x) for x in val)
+            else:
+                parts.append(str(val))
+        return "\n".join(parts).lower()
+
+    def _locc_value(self, metadata: Dict[str, Any]) -> str:
+        for key in ("locc", "LoCC", "loc_class", "locc_code"):
+            if key in metadata and metadata[key] is not None:
+                return str(metadata[key]).strip().upper()
+        return ""
+
+    def _basic_text_reject(self, text: str) -> Optional[TextFilterResult]:
+        total_chars = len(text)
+        if total_chars < self.min_chars:
+            return TextFilterResult(False, "too_short", {"chars": total_chars})
+        sample = text[: self.max_filter_chars] if self.max_filter_chars > 0 else text
+        sample_chars = max(1, len(sample))
+        lower = sample.lower()
+        alpha_ratio = sum(1 for c in sample if c.isalpha()) / sample_chars
+        if alpha_ratio < self.min_alpha_ratio:
+            return TextFilterResult(False, "low_alpha_ratio", {"chars": total_chars, "alpha_ratio": alpha_ratio})
+
+        unicode_placeholder_count = len(self.UNICODE_PLACEHOLDER_RE.findall(sample))
+        brace_tilde_count = len(self.GENERIC_BRACE_TILDE_RE.findall(sample))
+        brace_tilde_density = brace_tilde_count / max(1, sample_chars / 1000.0)
+        if self.reject_unicode_placeholder_artifacts and (
+            unicode_placeholder_count >= self.unicode_placeholder_reject_threshold
+            or brace_tilde_density > self.max_brace_tilde_density * 1000.0
+        ):
+            return TextFilterResult(False, "unicode_placeholder_artifacts", {
+                "unicode_placeholder_count": unicode_placeholder_count,
+                "brace_tilde_count": brace_tilde_count,
+                "brace_tilde_density_per_1k_chars": brace_tilde_density,
+            })
+
+        boilerplate_hits = sum(1 for term in self.BOILERPLATE_TERMS if term in lower)
+        if self.reject_boilerplate and boilerplate_hits:
+            return TextFilterResult(False, "boilerplate", {"boilerplate_hits": boilerplate_hits})
+
+        table_index_hits = sum(1 for term in self.TABLE_INDEX_TERMS if term in lower)
+        dot_leader_count = len(self.DOT_LEADER_RE.findall(sample))
+        if self.reject_table_index_heavy and (table_index_hits >= 2 or dot_leader_count >= 20):
+            return TextFilterResult(False, "table_or_index_heavy", {"table_index_hits": table_index_hits, "dot_leader_count": dot_leader_count})
+
+        quote_chars = sample.count('"') + sample.count("“") + sample.count("”") + sample.count("'") // 4
+        quote_density = quote_chars / sample_chars
+        if quote_density > self.max_quote_density:
+            return TextFilterResult(False, "high_quote_density", {"quote_density": quote_density})
+
+        lines = [ln.strip() for ln in sample.splitlines() if ln.strip()]
+        total_lines = max(1, len(lines))
+        dialogue_lines = 0
+        short_lines = 0
+        speaker_lines = 0
+        for ln in lines:
+            if len(ln) <= 80:
+                short_lines += 1
+            if ln.startswith(('"', "'", "“", "‘", "—")) or (len(ln) <= 160 and ('"' in ln or "“" in ln or "”" in ln)):
+                dialogue_lines += 1
+            if self.SPEAKER_RE.match(ln):
+                speaker_lines += 1
+        dialogue_line_ratio = dialogue_lines / total_lines
+        short_line_ratio = short_lines / total_lines
+        play_line_ratio = speaker_lines / total_lines
+        if dialogue_line_ratio > self.max_dialogue_line_ratio:
+            return TextFilterResult(False, "high_dialogue_line_ratio", {"dialogue_line_ratio": dialogue_line_ratio})
+        if self.reject_poetry_or_play_format and (short_line_ratio > 0.72 or play_line_ratio > 0.12):
+            return TextFilterResult(False, "poetry_or_play_format", {"short_line_ratio": short_line_ratio, "speaker_line_ratio": play_line_ratio})
+        return None
+
+    def evaluate(self, text: str) -> TextFilterResult:
+        # Without metadata, this filter can only use fallback text logic.
+        if self.fallback_filter is not None:
+            return self.fallback_filter.evaluate(text)
+        reject = self._basic_text_reject(text)
+        if reject is not None:
+            return reject
+        return TextFilterResult(False, "missing_metadata", {})
+
+    def evaluate_record(self, text: str, record: Optional[Dict[str, Any]] = None) -> TextFilterResult:
+        reject = self._basic_text_reject(text)
+        if reject is not None:
+            return reject
+
+        metadata = self._parse_metadata(record)
+        metadata_text = self._metadata_text(metadata)
+        locc = self._locc_value(metadata)
+        if not metadata_text and not locc:
+            if self.fallback_filter is not None:
+                result = self.fallback_filter.evaluate(text)
+                if result.keep:
+                    result.reason = "accepted_fallback_text_filter"
+                return result
+            return TextFilterResult(False, "missing_metadata", {})
+
+        negative_hits = sum(1 for term in self.negative_metadata_terms if term in metadata_text)
+        if negative_hits >= self.negative_term_reject_threshold:
+            return TextFilterResult(False, "negative_metadata_terms", {"negative_metadata_hits": negative_hits, "locc": locc})
+
+        positive_hits = sum(1 for term in self.positive_metadata_terms if term in metadata_text)
+        locc_match = bool(locc) and any(locc.startswith(prefix) for prefix in self.positive_locc_prefixes)
+        metrics = {
+            "positive_metadata_hits": positive_hits,
+            "negative_metadata_hits": negative_hits,
+            "locc": locc,
+            "locc_match": locc_match,
+            "title": str(metadata.get("title", ""))[:160],
+        }
+        if positive_hits > 0 or locc_match:
+            return TextFilterResult(True, "accepted_gutenberg_metadata", metrics)
+
+        if self.fallback_filter is not None:
+            result = self.fallback_filter.evaluate(text)
+            merged = dict(result.metrics)
+            merged.update(metrics)
+            if result.keep:
+                return TextFilterResult(True, "accepted_fallback_text_filter", merged)
+            return TextFilterResult(False, "metadata_no_positive_match_and_" + result.reason, merged)
+        return TextFilterResult(False, "metadata_no_positive_match", metrics)
+
 def build_text_filter(cfg: Optional[Dict[str, Any]]) -> TextFilter:
     if not cfg:
         return NoOpTextFilter({})
@@ -443,7 +668,12 @@ def build_text_filter(cfg: Optional[Dict[str, Any]]) -> TextFilter:
         return NoOpTextFilter(cfg)
     if filter_type == "history_entity_dense_v1":
         return HistoryEntityDenseV1Filter(cfg)
-    raise ValueError(f"Unsupported raw text filter type: {filter_type!r}. Supported: none, history_entity_dense_v1")
+    if filter_type == "gutenberg_history_metadata_v1":
+        return GutenbergHistoryMetadataV1Filter(cfg)
+    raise ValueError(
+        f"Unsupported raw text filter type: {filter_type!r}. "
+        "Supported: none, history_entity_dense_v1, gutenberg_history_metadata_v1"
+    )
 
 
 class SourceBackend(ABC):
@@ -1322,12 +1552,12 @@ class HFRawTextSource(SourceBackend):
         samples.append({"reason": reason, "snippet": snippet, "metrics": dict(metrics)})
         self.logger.info(
             "hf_raw_text filter_sample source=%s filter=%s accepted=%s reason=%s snippet=%r metrics=%s",
-            self.name, self.filter_type, accepted, reason, snippet[:240], {k: metrics.get(k) for k in ("entity_like_count", "year_count", "history_term_count", "negative_hits", "unicode_placeholder_count", "brace_tilde_count", "brace_tilde_density_per_1k_chars", "quote_density", "dialogue_line_ratio", "score") if k in metrics},
+            self.name, self.filter_type, accepted, reason, snippet[:240], {k: metrics.get(k) for k in ("entity_like_count", "year_count", "history_term_count", "negative_hits", "positive_metadata_hits", "negative_metadata_hits", "locc", "locc_match", "title", "unicode_placeholder_count", "brace_tilde_count", "brace_tilde_density_per_1k_chars", "quote_density", "dialogue_line_ratio", "score") if k in metrics},
         )
 
-    def _filter_accepts(self, text: str) -> bool:
+    def _filter_accepts(self, text: str, record: Optional[Dict[str, Any]] = None) -> bool:
         self.filter_stats["records_seen"] = int(self.filter_stats.get("records_seen", 0)) + 1
-        result = self.text_filter.evaluate(text)
+        result = self.text_filter.evaluate_record(text, record)
         if result.keep:
             self.filter_stats["records_accepted"] = int(self.filter_stats.get("records_accepted", 0)) + 1
             self._remember_filter_sample(accepted=True, reason=result.reason, text=text, metrics=result.metrics)
@@ -1398,13 +1628,13 @@ class HFRawTextSource(SourceBackend):
             start = max(end, start + 1)
         return chunks
 
-    def _accepted_tokenization_chunks(self, text: str) -> List[Tuple[str, bool]]:
+    def _accepted_tokenization_chunks(self, text: str, record: Optional[Dict[str, Any]] = None) -> List[Tuple[str, bool]]:
         text = self._strip_gutenberg_regions(text)
         if not text:
             return []
 
         if not self.filter_after_chunking:
-            if not self._filter_accepts(text):
+            if not self._filter_accepts(text, record):
                 return []
             chunks = self._split_text_into_candidate_chunks(text)
         else:
@@ -1416,7 +1646,7 @@ class HFRawTextSource(SourceBackend):
                     reasons = self.filter_stats.setdefault("rejection_reasons", {})
                     reasons["chunk_too_short"] = int(reasons.get("chunk_too_short", 0)) + 1
                     continue
-                if self._filter_accepts(candidate):
+                if self._filter_accepts(candidate, record):
                     chunks.append(candidate)
                 else:
                     self._maybe_log_filter_starvation()
@@ -1512,7 +1742,7 @@ class HFRawTextSource(SourceBackend):
                 reasons["too_large_raw_doc"] = int(reasons.get("too_large_raw_doc", 0)) + 1
                 self._maybe_log_filter_starvation()
                 continue
-            accepted_chunks = self._accepted_tokenization_chunks(text)
+            accepted_chunks = self._accepted_tokenization_chunks(text, ex if isinstance(ex, dict) else None)
             if not accepted_chunks:
                 self._maybe_log_filter_starvation()
                 continue
