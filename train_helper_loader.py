@@ -238,6 +238,12 @@ class HistoryEntityDenseV1Filter(TextFilter):
     DIGIT_TOKEN_RE = re.compile(r"\b\S*\d\S*\b")
     SPEAKER_RE = re.compile(r"^\s{0,4}[A-Z][A-Z .,'-]{1,40}:\s+")
     DOT_LEADER_RE = re.compile(r"\.{4,}")
+    UNICODE_PLACEHOLDER_RE = re.compile(
+        r"\{~\s*(?:GREEK|LATIN|HEBREW|ARABIC|CYRILLIC|COPTIC|SYRIAC|ARMENIAN|GEORGIAN)\s+"
+        r"(?:SMALL|CAPITAL)?\s*(?:LETTER|CHARACTER|SIGN|MARK)[^}]*~\}",
+        re.IGNORECASE,
+    )
+    GENERIC_BRACE_TILDE_RE = re.compile(r"\{~[^}]{1,160}~\}")
 
     DEFAULT_HISTORY_TERMS = (
         "century", "king", "queen", "empire", "war", "battle", "revolution",
@@ -289,6 +295,9 @@ class HistoryEntityDenseV1Filter(TextFilter):
         self.require_entity_and_fact_signal = bool(cfg.get("require_entity_and_fact_signal", False))
         self.strong_history_term_count = int(cfg.get("strong_history_term_count", max(12, self.min_history_term_count)))
         self.negative_term_reject_threshold = int(cfg.get("negative_term_reject_threshold", 2))
+        self.reject_unicode_placeholder_artifacts = bool(cfg.get("reject_unicode_placeholder_artifacts", True))
+        self.unicode_placeholder_reject_threshold = int(cfg.get("unicode_placeholder_reject_threshold", 8))
+        self.max_brace_tilde_density = float(cfg.get("max_brace_tilde_density", 0.002))
         negative_terms = cfg.get("negative_terms") or self.DEFAULT_NEGATIVE_TERMS
         self.negative_terms = tuple(str(t).lower() for t in negative_terms)
         self.score_threshold = cfg.get("score_threshold", None)
@@ -308,6 +317,24 @@ class HistoryEntityDenseV1Filter(TextFilter):
         alpha_ratio = sum(1 for c in sample if c.isalpha()) / sample_chars
         if alpha_ratio < self.min_alpha_ratio:
             return TextFilterResult(False, "low_alpha_ratio", {"chars": total_chars, "alpha_ratio": alpha_ratio})
+
+        unicode_placeholder_count = len(self.UNICODE_PLACEHOLDER_RE.findall(sample))
+        brace_tilde_count = len(self.GENERIC_BRACE_TILDE_RE.findall(sample))
+        brace_tilde_density = brace_tilde_count / max(1, sample_chars / 1000.0)
+        if self.reject_unicode_placeholder_artifacts and (
+            unicode_placeholder_count >= self.unicode_placeholder_reject_threshold
+            or brace_tilde_density > self.max_brace_tilde_density * 1000.0
+        ):
+            return TextFilterResult(
+                False,
+                "unicode_placeholder_artifacts",
+                {
+                    "unicode_placeholder_count": unicode_placeholder_count,
+                    "brace_tilde_count": brace_tilde_count,
+                    "brace_tilde_density_per_1k_chars": brace_tilde_density,
+                    "chars": total_chars,
+                },
+            )
 
         boilerplate_hits = sum(1 for term in self.BOILERPLATE_TERMS if term in lower)
         if self.reject_boilerplate and boilerplate_hits:
@@ -388,6 +415,9 @@ class HistoryEntityDenseV1Filter(TextFilter):
             "number_count": number_count,
             "history_term_count": history_term_count,
             "negative_hits": negative_hits,
+            "unicode_placeholder_count": unicode_placeholder_count,
+            "brace_tilde_count": brace_tilde_count,
+            "brace_tilde_density_per_1k_chars": brace_tilde_density,
             "quote_density": quote_density,
             "dialogue_line_ratio": dialogue_line_ratio,
             "short_line_ratio": short_line_ratio,
@@ -1264,7 +1294,7 @@ class HFRawTextSource(SourceBackend):
         samples.append({"reason": reason, "snippet": snippet, "metrics": dict(metrics)})
         self.logger.info(
             "hf_raw_text filter_sample source=%s filter=%s accepted=%s reason=%s snippet=%r metrics=%s",
-            self.name, self.filter_type, accepted, reason, snippet[:240], {k: metrics.get(k) for k in ("entity_like_count", "year_count", "history_term_count", "negative_hits", "quote_density", "dialogue_line_ratio", "score") if k in metrics},
+            self.name, self.filter_type, accepted, reason, snippet[:240], {k: metrics.get(k) for k in ("entity_like_count", "year_count", "history_term_count", "negative_hits", "unicode_placeholder_count", "brace_tilde_count", "brace_tilde_density_per_1k_chars", "quote_density", "dialogue_line_ratio", "score") if k in metrics},
         )
 
     def _filter_accepts(self, text: str) -> bool:
