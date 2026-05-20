@@ -1003,6 +1003,14 @@ class HFRawTextSource(SourceBackend):
         # tokenization so the global tokenizer pool can parallelize work. EOT is
         # preserved only on the final chunk of the original document.
         self.tokenizer_chunk_chars = int(cfg.get("tokenizer_chunk_chars", cfg.get("raw_text_chunk_chars", 200_000)))
+        # Diagnostics for sources that exhaust suspiciously quickly or filters
+        # that reject nearly everything. Exhaustion still always repeats, but
+        # these counters make tiny/broken sources obvious in the log.
+        self.small_epoch_warn_records = int(cfg.get("small_epoch_warn_records", 100))
+        self.small_epoch_warn_accepted = int(cfg.get("small_epoch_warn_accepted", 1))
+        self.filter_starvation_warn_records = int(cfg.get("filter_starvation_warn_records", 1000))
+        self.filter_starvation_warn_accepts = int(cfg.get("filter_starvation_warn_accepts", 1))
+        self.filter_starvation_warn_interval_seconds = max(1.0, float(cfg.get("filter_starvation_warn_interval_seconds", 120.0)))
         self.exhaustion_policy = "repeat"
         self.raw_manager = raw_manager
         self.token_queue = raw_manager.register_source(self.name)
@@ -1026,6 +1034,13 @@ class HFRawTextSource(SourceBackend):
         self.last_example_index_read = -1
         self.last_example_index_emitted = -1
         self.errors: List[str] = []
+        self._epoch_records_seen_start = 0
+        self._epoch_records_accepted_start = 0
+        self._epoch_records_rejected_start = 0
+        self._epoch_tokens_emitted_start = 0
+        self._tiny_epoch_repeats = 0
+        self._last_filter_starvation_warning_time = 0.0
+        self._last_filter_starvation_warning_seen = 0
 
     def start(self) -> None:
         with self._lock:
@@ -1110,13 +1125,99 @@ class HFRawTextSource(SourceBackend):
         self._dataset_obj = ds
         self._iterator = iter(ds)
         self.last_example_index_read = -1
+        self._mark_epoch_start()
+
+    def _mark_epoch_start(self) -> None:
+        self._epoch_records_seen_start = int(self.filter_stats.get("records_seen", 0))
+        self._epoch_records_accepted_start = int(self.filter_stats.get("records_accepted", 0))
+        self._epoch_records_rejected_start = int(self.filter_stats.get("records_rejected", 0))
+        self._epoch_tokens_emitted_start = int(self.tokens_emitted)
+
+    def _epoch_progress(self) -> Dict[str, int]:
+        return {
+            "records_seen": int(self.filter_stats.get("records_seen", 0)) - self._epoch_records_seen_start,
+            "records_accepted": int(self.filter_stats.get("records_accepted", 0)) - self._epoch_records_accepted_start,
+            "records_rejected": int(self.filter_stats.get("records_rejected", 0)) - self._epoch_records_rejected_start,
+            "tokens_emitted": int(self.tokens_emitted) - self._epoch_tokens_emitted_start,
+        }
+
+    def _log_epoch_exhaustion(self, *, old_epoch: int, new_epoch: int) -> None:
+        progress = self._epoch_progress()
+        reasons = dict(self.filter_stats.get("rejection_reasons", {}))
+        top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        suspicious_small_epoch = (
+            progress["records_seen"] < self.small_epoch_warn_records
+            or progress["records_accepted"] < self.small_epoch_warn_accepted
+        )
+        if suspicious_small_epoch:
+            self._tiny_epoch_repeats += 1
+            self.logger.warning(
+                "hf_raw_text source=%s exhausted suspiciously small epoch=%d repeating=%d "
+                "epoch_records_seen=%d epoch_accepted=%d epoch_rejected=%d epoch_tokens_emitted=%d "
+                "total_records_seen=%d total_accepted=%d total_rejected=%d tiny_epoch_repeats=%d top_rejection_reasons=%s "
+                "If this is not an intentionally tiny dataset, verify dataset/config/split/streaming independently.",
+                self.name,
+                old_epoch,
+                new_epoch,
+                progress["records_seen"],
+                progress["records_accepted"],
+                progress["records_rejected"],
+                progress["tokens_emitted"],
+                int(self.filter_stats.get("records_seen", 0)),
+                int(self.filter_stats.get("records_accepted", 0)),
+                int(self.filter_stats.get("records_rejected", 0)),
+                self._tiny_epoch_repeats,
+                top_reasons,
+            )
+        else:
+            self._tiny_epoch_repeats = 0
+            self.logger.info(
+                "hf_raw_text source=%s exhausted epoch=%d repeating=%d epoch_records_seen=%d "
+                "epoch_accepted=%d epoch_rejected=%d epoch_tokens_emitted=%d top_rejection_reasons=%s",
+                self.name,
+                old_epoch,
+                new_epoch,
+                progress["records_seen"],
+                progress["records_accepted"],
+                progress["records_rejected"],
+                progress["tokens_emitted"],
+                top_reasons,
+            )
+
+    def _maybe_log_filter_starvation(self) -> None:
+        seen = int(self.filter_stats.get("records_seen", 0))
+        accepted = int(self.filter_stats.get("records_accepted", 0))
+        rejected = int(self.filter_stats.get("records_rejected", 0))
+        seen_since_last = seen - self._last_filter_starvation_warning_seen
+        if seen_since_last < self.filter_starvation_warn_records:
+            return
+        now = _now()
+        if now - self._last_filter_starvation_warning_time < self.filter_starvation_warn_interval_seconds:
+            return
+        if accepted < self.filter_starvation_warn_accepts or (seen > 0 and accepted / max(1, seen) < 0.001):
+            reasons = dict(self.filter_stats.get("rejection_reasons", {}))
+            top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:8]
+            self.logger.warning(
+                "hf_raw_text filter_starvation source=%s filter=%s records_seen=%d accepted=%d rejected=%d "
+                "acceptance_rate=%.6f top_rejection_reasons=%s",
+                self.name,
+                self.filter_type,
+                seen,
+                accepted,
+                rejected,
+                accepted / max(1, seen),
+                top_reasons,
+            )
+            self._last_filter_starvation_warning_time = now
+            self._last_filter_starvation_warning_seen = seen
 
     def _restart_after_exhaustion(self) -> None:
         old_epoch = self.source_epoch
-        self.source_epoch += 1
+        new_epoch = old_epoch + 1
+        self._log_epoch_exhaustion(old_epoch=old_epoch, new_epoch=new_epoch)
+        self.source_epoch = new_epoch
         self._iterator = None
         self._dataset_obj = None
-        self.logger.info("hf_raw_text source=%s exhausted epoch=%d; repeating epoch=%d", self.name, old_epoch, self.source_epoch)
         self._open_iterator()
 
     def _remember_filter_sample(self, *, accepted: bool, reason: str, text: str, metrics: Dict[str, Any]) -> None:
@@ -1205,13 +1306,20 @@ class HFRawTextSource(SourceBackend):
             if not text:
                 continue
             b = len(text.encode("utf-8", errors="ignore"))
+            # examples_read/raw_bytes_read mean raw records read from source, not
+            # accepted records. Accepted/emitted records are tracked separately
+            # through filter_stats and examples_emitted.
+            self.examples_read += 1
+            self.raw_bytes_read += b
             if self.max_raw_doc_bytes is not None and b > self.max_raw_doc_bytes:
                 self.filter_stats["records_seen"] = int(self.filter_stats.get("records_seen", 0)) + 1
                 self.filter_stats["records_rejected"] = int(self.filter_stats.get("records_rejected", 0)) + 1
                 reasons = self.filter_stats.setdefault("rejection_reasons", {})
                 reasons["too_large_raw_doc"] = int(reasons.get("too_large_raw_doc", 0)) + 1
+                self._maybe_log_filter_starvation()
                 continue
             if not self._filter_accepts(text):
+                self._maybe_log_filter_starvation()
                 continue
             if first_idx is None:
                 first_idx = idx
@@ -1220,8 +1328,6 @@ class HFRawTextSource(SourceBackend):
                 texts.append(chunk_text)
                 append_eot_flags.append(chunk_append_eot)
                 raw_bytes += len(chunk_text.encode("utf-8", errors="ignore"))
-            self.examples_read += 1
-            self.raw_bytes_read += b
         if not texts:
             return False
         ok = self.raw_manager.submit(RawTextBatch(
@@ -1269,12 +1375,19 @@ class HFRawTextSource(SourceBackend):
                 self._read_next_raw_batch_and_submit()
                 now = _now()
                 if now - last_heartbeat >= self.heartbeat_interval_seconds:
+                    reasons = dict(self.filter_stats.get("rejection_reasons", {}))
+                    top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
                     self.logger.info(
-                        "hf_raw_text heartbeat source=%s action=waiting_for_tokens target=%d collected=%d elapsed=%.1fs epoch=%d examples_read=%d examples_emitted=%d raw_batches=%d token_batches=%d inflight=%d source_token_q=%d raw_q_items=%d raw_q_gib=%.2f manager_errors=%d queue_empty=%d",
+                        "hf_raw_text heartbeat source=%s action=waiting_for_tokens target=%d collected=%d elapsed=%.1fs epoch=%d examples_read=%d examples_emitted=%d records_seen=%d accepted=%d rejected=%d raw_batches=%d token_batches=%d inflight=%d source_token_q=%d raw_q_items=%d raw_q_gib=%.2f manager_errors=%d queue_empty=%d top_rejection_reasons=%s",
                         self.name, target_tokens, token_count, now - chunk_start_time, self.source_epoch,
-                        self.examples_read, self.examples_emitted, self.raw_batches, self.token_batches,
+                        self.examples_read, self.examples_emitted,
+                        int(self.filter_stats.get("records_seen", 0)),
+                        int(self.filter_stats.get("records_accepted", 0)),
+                        int(self.filter_stats.get("records_rejected", 0)),
+                        self.raw_batches, self.token_batches,
                         self._inflight_batches, self.token_queue.qsize(), self.raw_manager.raw_queue.current_items,
                         self.raw_manager.raw_queue.current_bytes / (1024**3), len(self.raw_manager.errors), queue_empty_count,
+                        top_reasons,
                     )
                     last_heartbeat = now
                 continue
@@ -1294,12 +1407,18 @@ class HFRawTextSource(SourceBackend):
             last_epoch = item.source_epoch if last_epoch is None else max(last_epoch, item.source_epoch)
             now = _now()
             if now - last_heartbeat >= self.heartbeat_interval_seconds:
+                reasons = dict(self.filter_stats.get("rejection_reasons", {}))
+                top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:5]
                 self.logger.info(
-                    "hf_raw_text heartbeat source=%s action=collecting_tokens target=%d collected=%d pct=%.2f elapsed=%.1fs epoch=%d examples_read=%d examples_emitted=%d raw_batches=%d token_batches=%d inflight=%d source_token_q=%d raw_q_items=%d raw_q_gib=%.2f",
+                    "hf_raw_text heartbeat source=%s action=collecting_tokens target=%d collected=%d pct=%.2f elapsed=%.1fs epoch=%d examples_read=%d examples_emitted=%d records_seen=%d accepted=%d rejected=%d raw_batches=%d token_batches=%d inflight=%d source_token_q=%d raw_q_items=%d raw_q_gib=%.2f top_rejection_reasons=%s",
                     self.name, target_tokens, token_count, 100.0 * min(1.0, token_count / max(1, target_tokens)), now - chunk_start_time,
-                    self.source_epoch, self.examples_read, self.examples_emitted, self.raw_batches, self.token_batches,
+                    self.source_epoch, self.examples_read, self.examples_emitted,
+                    int(self.filter_stats.get("records_seen", 0)),
+                    int(self.filter_stats.get("records_accepted", 0)),
+                    int(self.filter_stats.get("records_rejected", 0)),
+                    self.raw_batches, self.token_batches,
                     self._inflight_batches, self.token_queue.qsize(), self.raw_manager.raw_queue.current_items,
-                    self.raw_manager.raw_queue.current_bytes / (1024**3),
+                    self.raw_manager.raw_queue.current_bytes / (1024**3), top_reasons,
                 )
                 last_heartbeat = now
 
@@ -1390,6 +1509,10 @@ class HFRawTextSource(SourceBackend):
             "load_dataset_calls": self.load_dataset_calls,
             "inflight_batches": self._inflight_batches,
             "prefetch_batches": self.prefetch_batches,
+            "small_epoch_warn_records": self.small_epoch_warn_records,
+            "small_epoch_warn_accepted": self.small_epoch_warn_accepted,
+            "filter_starvation_warn_records": self.filter_starvation_warn_records,
+            "tiny_epoch_repeats": self._tiny_epoch_repeats,
             "errors": list(self.errors[-20:]),
             "state_exactness": "best_effort_stream_position",
             "global_shared_raw_resources": True,
@@ -1423,6 +1546,8 @@ class HFRawTextSource(SourceBackend):
             self.filter_stats.setdefault("rejected_samples", [])
         self.load_dataset_seconds_total = float(state.get("load_dataset_seconds_total", 0.0))
         self.load_dataset_calls = int(state.get("load_dataset_calls", 0))
+        self._tiny_epoch_repeats = int(state.get("tiny_epoch_repeats", 0))
+        self._mark_epoch_start()
 
 
 class BatchHelper:
