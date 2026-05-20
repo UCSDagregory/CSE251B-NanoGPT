@@ -1044,6 +1044,11 @@ class HFRawTextSource(SourceBackend):
         # repeated epochs cannot satisfy a weighted request and must not hang.
         self.max_zero_accept_epochs = int(cfg.get("max_zero_accept_epochs", 2))
         self.max_zero_accept_records = int(cfg.get("max_zero_accept_records", 50_000))
+        # Fail if a filtered source technically accepts some chunks but at such
+        # a low rate that it cannot practically satisfy a weighted token request.
+        # Default 0 disables this globally; enable per filtered source.
+        self.min_filter_acceptance_rate = float(cfg.get("min_filter_acceptance_rate", 0.0))
+        self.min_filter_acceptance_records = int(cfg.get("min_filter_acceptance_records", 50_000))
         # Diagnostics for sources that exhaust suspiciously quickly or filters
         # that reject nearly everything. Exhaustion still always repeats, but
         # these counters make tiny/broken sources obvious in the log.
@@ -1252,6 +1257,7 @@ class HFRawTextSource(SourceBackend):
             )
             self._last_filter_starvation_warning_time = now
             self._last_filter_starvation_warning_seen = seen
+            self._check_low_acceptance_failfast(context="filter_starvation")
 
     def _check_zero_accept_failfast(self, *, old_epoch: int, new_epoch: int) -> None:
         total_seen = int(self.filter_stats.get("records_seen", 0))
@@ -1275,11 +1281,33 @@ class HFRawTextSource(SourceBackend):
             f"strip_gutenberg_boilerplate=True and filter_after_chunking=True, or choose a different source."
         )
 
+    def _check_low_acceptance_failfast(self, *, context: str) -> None:
+        if self.min_filter_acceptance_rate <= 0:
+            return
+        total_seen = int(self.filter_stats.get("records_seen", 0))
+        total_accepted = int(self.filter_stats.get("records_accepted", 0))
+        total_rejected = int(self.filter_stats.get("records_rejected", 0))
+        if total_seen < self.min_filter_acceptance_records:
+            return
+        rate = total_accepted / max(1, total_seen)
+        if rate >= self.min_filter_acceptance_rate:
+            return
+        reasons = dict(self.filter_stats.get("rejection_reasons", {}))
+        top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        raise RuntimeError(
+            f"hf_raw_text source {self.name!r} has unusably low filter acceptance during {context}: "
+            f"accepted {total_accepted}/{total_seen} records/chunks "
+            f"({rate:.6%}) below min_filter_acceptance_rate={self.min_filter_acceptance_rate:.6%}. "
+            f"Rejected={total_rejected}. Top rejection reasons: {top_reasons}. "
+            f"This source/filter combination is not producing enough usable data and would stall reserve building."
+        )
+
     def _restart_after_exhaustion(self) -> None:
         old_epoch = self.source_epoch
         new_epoch = old_epoch + 1
         self._log_epoch_exhaustion(old_epoch=old_epoch, new_epoch=new_epoch)
         self._check_zero_accept_failfast(old_epoch=old_epoch, new_epoch=new_epoch)
+        self._check_low_acceptance_failfast(context=f"epoch_exhaustion_{old_epoch}_to_{new_epoch}")
         self.source_epoch = new_epoch
         self._iterator = None
         self._dataset_obj = None
@@ -1724,6 +1752,10 @@ class HFRawTextSource(SourceBackend):
             self.max_zero_accept_epochs = int(state.get("max_zero_accept_epochs") or self.max_zero_accept_epochs)
         if "max_zero_accept_records" in state:
             self.max_zero_accept_records = int(state.get("max_zero_accept_records") or self.max_zero_accept_records)
+        if "min_filter_acceptance_rate" in state:
+            self.min_filter_acceptance_rate = float(state.get("min_filter_acceptance_rate") or self.min_filter_acceptance_rate)
+        if "min_filter_acceptance_records" in state:
+            self.min_filter_acceptance_records = int(state.get("min_filter_acceptance_records") or self.min_filter_acceptance_records)
         if "filter_stats" in state:
             saved_stats = dict(state.get("filter_stats") or {})
             self.filter_stats.update(saved_stats)
