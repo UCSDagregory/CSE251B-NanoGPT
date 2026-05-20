@@ -191,6 +191,193 @@ class TokenizedBatch:
     source_epoch: int = 0
 
 
+@dataclass
+class TextFilterResult:
+    keep: bool
+    reason: str
+    metrics: Dict[str, Any] = field(default_factory=dict)
+
+
+class TextFilter(ABC):
+    filter_type = "base"
+
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = dict(cfg or {})
+
+    @abstractmethod
+    def evaluate(self, text: str) -> TextFilterResult:
+        raise NotImplementedError
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"type": self.filter_type, "cfg": dict(self.cfg)}
+
+
+class NoOpTextFilter(TextFilter):
+    filter_type = "none"
+
+    def evaluate(self, text: str) -> TextFilterResult:
+        return TextFilterResult(True, "accepted_no_filter", {})
+
+
+class HistoryEntityDenseV1Filter(TextFilter):
+    """Fast pre-tokenization filter for history/entity/fact-dense book text.
+
+    This is intentionally regex/lightweight. It is designed to reject broad
+    fiction/dialogue/boilerplate-heavy PG19-style book text before tokenization,
+    while keeping expository, historical, entity/date-dense passages.
+    """
+
+    filter_type = "history_entity_dense_v1"
+    ENTITY_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b")
+    YEAR_RE = re.compile(r"\b(?:1[0-9]{3}|20[0-2][0-9])\b")
+    WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+    DIGIT_TOKEN_RE = re.compile(r"\b\S*\d\S*\b")
+    SPEAKER_RE = re.compile(r"^\s{0,4}[A-Z][A-Z .,'-]{1,40}:\s+")
+    DOT_LEADER_RE = re.compile(r"\.{4,}")
+
+    DEFAULT_HISTORY_TERMS = (
+        "century", "king", "queen", "empire", "war", "battle", "revolution",
+        "parliament", "colony", "province", "expedition", "army", "navy",
+        "treaty", "reign", "dynasty", "historian", "biography", "born",
+        "died", "government", "church", "kingdom", "republic", "ancient",
+        "medieval", "colonial", "roman", "greek", "france", "england",
+        "britain", "europe", "india", "china", "america", "congress",
+        "emperor", "president", "minister", "constitution", "campaign",
+        "invasion", "siege", "treatise", "chronicle", "annals", "bishop",
+        "monastery", "senate", "republican", "imperial", "civilization",
+    )
+    BOILERPLATE_TERMS = (
+        "project gutenberg", "gutenberg license", "start of the project gutenberg",
+        "end of the project gutenberg", "transcriber's note", "transcriber note",
+        "produced by", "distributed proofreaders", "copyright", "all rights reserved",
+    )
+    TABLE_INDEX_TERMS = (
+        "table of contents", "contents", "index", "list of illustrations",
+        "list of plates", "bibliography", "catalogue",
+    )
+
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__(cfg)
+        self.min_chars = int(cfg.get("min_chars", 1000))
+        self.max_filter_chars = int(cfg.get("max_filter_chars", cfg.get("filter_eval_max_chars", 300_000)))
+        self.min_alpha_ratio = float(cfg.get("min_alpha_ratio", 0.45))
+        self.min_entity_like_count = int(cfg.get("min_entity_like_count", 12))
+        self.min_year_count = int(cfg.get("min_year_count", 3))
+        self.min_history_term_count = int(cfg.get("min_history_term_count", 8))
+        self.min_number_count = int(cfg.get("min_number_count", 0))
+        self.min_year_count_or_history_terms = bool(cfg.get("min_year_count_or_history_terms", True))
+        self.max_quote_density = float(cfg.get("max_quote_density", 0.025))
+        self.max_dialogue_line_ratio = float(cfg.get("max_dialogue_line_ratio", 0.15))
+        self.reject_boilerplate = bool(cfg.get("reject_boilerplate", True))
+        self.reject_poetry_or_play_format = bool(cfg.get("reject_poetry_or_play_format", True))
+        self.reject_table_index_heavy = bool(cfg.get("reject_table_index_heavy", True))
+        self.score_threshold = cfg.get("score_threshold", None)
+        self.score_threshold = None if self.score_threshold is None else float(self.score_threshold)
+        terms = cfg.get("history_terms") or self.DEFAULT_HISTORY_TERMS
+        self.history_terms = tuple(str(t).lower() for t in terms)
+        self.history_term_re = re.compile(r"\b(?:" + "|".join(re.escape(t) for t in self.history_terms) + r")s?\b", re.IGNORECASE)
+
+    def evaluate(self, text: str) -> TextFilterResult:
+        total_chars = len(text)
+        if total_chars < self.min_chars:
+            return TextFilterResult(False, "too_short", {"chars": total_chars})
+
+        sample = text[: self.max_filter_chars] if self.max_filter_chars > 0 else text
+        sample_chars = max(1, len(sample))
+        lower = sample.lower()
+        alpha_ratio = sum(1 for c in sample if c.isalpha()) / sample_chars
+        if alpha_ratio < self.min_alpha_ratio:
+            return TextFilterResult(False, "low_alpha_ratio", {"chars": total_chars, "alpha_ratio": alpha_ratio})
+
+        boilerplate_hits = sum(1 for term in self.BOILERPLATE_TERMS if term in lower)
+        if self.reject_boilerplate and boilerplate_hits:
+            return TextFilterResult(False, "boilerplate", {"boilerplate_hits": boilerplate_hits})
+
+        table_index_hits = sum(1 for term in self.TABLE_INDEX_TERMS if term in lower)
+        dot_leader_count = len(self.DOT_LEADER_RE.findall(sample))
+        if self.reject_table_index_heavy and (table_index_hits >= 2 or dot_leader_count >= 20):
+            return TextFilterResult(False, "table_or_index_heavy", {"table_index_hits": table_index_hits, "dot_leader_count": dot_leader_count})
+
+        quote_chars = sample.count('"') + sample.count("“") + sample.count("”") + sample.count("'") // 4
+        quote_density = quote_chars / sample_chars
+        if quote_density > self.max_quote_density:
+            return TextFilterResult(False, "high_quote_density", {"quote_density": quote_density})
+
+        lines = [ln.strip() for ln in sample.splitlines() if ln.strip()]
+        total_lines = max(1, len(lines))
+        dialogue_lines = 0
+        short_lines = 0
+        speaker_lines = 0
+        for ln in lines:
+            if len(ln) <= 80:
+                short_lines += 1
+            if ln.startswith(('"', "'", "“", "‘", "—")) or (len(ln) <= 160 and ('"' in ln or "“" in ln or "”" in ln)):
+                dialogue_lines += 1
+            if self.SPEAKER_RE.match(ln):
+                speaker_lines += 1
+        dialogue_line_ratio = dialogue_lines / total_lines
+        short_line_ratio = short_lines / total_lines
+        play_line_ratio = speaker_lines / total_lines
+        if dialogue_line_ratio > self.max_dialogue_line_ratio:
+            return TextFilterResult(False, "high_dialogue_line_ratio", {"dialogue_line_ratio": dialogue_line_ratio})
+        if self.reject_poetry_or_play_format and len(lines) >= 20 and (short_line_ratio > 0.65 or play_line_ratio > 0.10):
+            return TextFilterResult(False, "poetry_or_play_format", {"short_line_ratio": short_line_ratio, "speaker_line_ratio": play_line_ratio})
+
+        words = self.WORD_RE.findall(sample)
+        word_count = max(1, len(words))
+        entity_like_count = len(self.ENTITY_RE.findall(sample))
+        year_count = len(self.YEAR_RE.findall(sample))
+        number_count = len(self.DIGIT_TOKEN_RE.findall(sample))
+        history_term_count = len(self.history_term_re.findall(sample))
+
+        has_entity_signal = entity_like_count >= self.min_entity_like_count
+        if self.min_year_count_or_history_terms:
+            has_fact_signal = year_count >= self.min_year_count or history_term_count >= self.min_history_term_count
+        else:
+            has_fact_signal = year_count >= self.min_year_count and history_term_count >= self.min_history_term_count
+        has_number_signal = number_count >= self.min_number_count
+
+        score = (
+            3.0 * year_count
+            + 2.0 * history_term_count
+            + 1.0 * entity_like_count
+            + 0.25 * number_count
+            - 20.0 * dialogue_line_ratio
+            - 10.0 * boilerplate_hits
+        )
+        metrics = {
+            "chars": total_chars,
+            "sample_chars": sample_chars,
+            "word_count": word_count,
+            "alpha_ratio": alpha_ratio,
+            "entity_like_count": entity_like_count,
+            "year_count": year_count,
+            "number_count": number_count,
+            "history_term_count": history_term_count,
+            "quote_density": quote_density,
+            "dialogue_line_ratio": dialogue_line_ratio,
+            "short_line_ratio": short_line_ratio,
+            "speaker_line_ratio": play_line_ratio,
+            "score": score,
+        }
+        if self.score_threshold is not None and score < self.score_threshold:
+            return TextFilterResult(False, "score_below_threshold", metrics)
+        if not (has_entity_signal or has_fact_signal or has_number_signal):
+            return TextFilterResult(False, "low_entity_date_history_density", metrics)
+        return TextFilterResult(True, "accepted_history_entity_dense", metrics)
+
+
+def build_text_filter(cfg: Optional[Dict[str, Any]]) -> TextFilter:
+    if not cfg:
+        return NoOpTextFilter({})
+    filter_type = str(cfg.get("type", "none"))
+    if filter_type in {"none", "noop", "no_filter"}:
+        return NoOpTextFilter(cfg)
+    if filter_type == "history_entity_dense_v1":
+        return HistoryEntityDenseV1Filter(cfg)
+    raise ValueError(f"Unsupported raw text filter type: {filter_type!r}. Supported: none, history_entity_dense_v1")
+
+
 class SourceBackend(ABC):
     def __init__(self, name: str, weight: float, backend: str, dtype: np.dtype, logger: logging.Logger):
         self.name = name
@@ -749,6 +936,19 @@ class HFRawTextSource(SourceBackend):
         self.fail_fast = bool(cfg.get("fail_fast", True))
         self.prefetch_batches = int(cfg.get("prefetch_batches", cfg.get("raw_prefetch_batches_per_source", 8)))
         self.heartbeat_interval_seconds = max(1.0, float(cfg.get("heartbeat_interval_seconds", cfg.get("heartbeat_interval", 30.0))))
+        self.text_filter_cfg = dict(cfg.get("filter") or {})
+        self.text_filter = build_text_filter(self.text_filter_cfg)
+        self.filter_type = self.text_filter.filter_type
+        self.filter_stats: Dict[str, Any] = {
+            "records_seen": 0,
+            "records_accepted": 0,
+            "records_rejected": 0,
+            "rejection_reasons": {},
+            "accepted_samples": [],
+            "rejected_samples": [],
+        }
+        self.filter_sample_chars = int(cfg.get("filter_sample_chars", 400))
+        self.filter_sample_limit = int(cfg.get("filter_sample_limit", 3))
         self.exhaustion_policy = "repeat"
         self.raw_manager = raw_manager
         self.token_queue = raw_manager.register_source(self.name)
@@ -781,11 +981,12 @@ class HFRawTextSource(SourceBackend):
             self.raw_manager.start()
             self._open_iterator()
             self.logger.info(
-                "hf_raw_text source=%s initialized dataset=%s config=%s exhaustion_policy=repeat global_raw_manager=True prefetch_batches=%d",
+                "hf_raw_text source=%s initialized dataset=%s config=%s exhaustion_policy=repeat global_raw_manager=True prefetch_batches=%d filter=%s",
                 self.name,
                 self.dataset,
                 self.dataset_config,
                 self.prefetch_batches,
+                self.filter_type,
             )
 
     def _open_iterator(self) -> None:
@@ -864,6 +1065,31 @@ class HFRawTextSource(SourceBackend):
         self.logger.info("hf_raw_text source=%s exhausted epoch=%d; repeating epoch=%d", self.name, old_epoch, self.source_epoch)
         self._open_iterator()
 
+    def _remember_filter_sample(self, *, accepted: bool, reason: str, text: str, metrics: Dict[str, Any]) -> None:
+        key = "accepted_samples" if accepted else "rejected_samples"
+        samples = self.filter_stats.setdefault(key, [])
+        if len(samples) >= self.filter_sample_limit:
+            return
+        snippet = " ".join(text[: self.filter_sample_chars].split())
+        samples.append({"reason": reason, "snippet": snippet, "metrics": dict(metrics)})
+        self.logger.info(
+            "hf_raw_text filter_sample source=%s filter=%s accepted=%s reason=%s snippet=%r metrics=%s",
+            self.name, self.filter_type, accepted, reason, snippet[:240], {k: metrics.get(k) for k in ("entity_like_count", "year_count", "history_term_count", "quote_density", "dialogue_line_ratio", "score") if k in metrics},
+        )
+
+    def _filter_accepts(self, text: str) -> bool:
+        self.filter_stats["records_seen"] = int(self.filter_stats.get("records_seen", 0)) + 1
+        result = self.text_filter.evaluate(text)
+        if result.keep:
+            self.filter_stats["records_accepted"] = int(self.filter_stats.get("records_accepted", 0)) + 1
+            self._remember_filter_sample(accepted=True, reason=result.reason, text=text, metrics=result.metrics)
+            return True
+        self.filter_stats["records_rejected"] = int(self.filter_stats.get("records_rejected", 0)) + 1
+        reasons = self.filter_stats.setdefault("rejection_reasons", {})
+        reasons[result.reason] = int(reasons.get(result.reason, 0)) + 1
+        self._remember_filter_sample(accepted=False, reason=result.reason, text=text, metrics=result.metrics)
+        return False
+
     def _read_next_raw_batch_and_submit(self) -> bool:
         if self._closed:
             return False
@@ -891,6 +1117,12 @@ class HFRawTextSource(SourceBackend):
                 continue
             b = len(text.encode("utf-8", errors="ignore"))
             if self.max_raw_doc_bytes is not None and b > self.max_raw_doc_bytes:
+                self.filter_stats["records_seen"] = int(self.filter_stats.get("records_seen", 0)) + 1
+                self.filter_stats["records_rejected"] = int(self.filter_stats.get("records_rejected", 0)) + 1
+                reasons = self.filter_stats.setdefault("rejection_reasons", {})
+                reasons["too_large_raw_doc"] = int(reasons.get("too_large_raw_doc", 0)) + 1
+                continue
+            if not self._filter_accepts(text):
                 continue
             if first_idx is None:
                 first_idx = idx
@@ -987,8 +1219,9 @@ class HFRawTextSource(SourceBackend):
         self.raw_bytes_emitted += raw_bytes
         self.last_example_index_emitted = max(self.last_example_index_emitted, last_idx)
         self.logger.info(
-            "hf_raw_text heartbeat source=%s action=chunk_ready tokens=%d target=%d elapsed=%.1fs examples=%d raw_bytes=%d epoch_start=%s epoch_end=%s",
+            "hf_raw_text heartbeat source=%s action=chunk_ready tokens=%d target=%d elapsed=%.1fs examples=%d raw_bytes=%d epoch_start=%s epoch_end=%s filter=%s accepted=%d rejected=%d",
             self.name, int(token_np.size), target_tokens, _now() - chunk_start_time, examples, raw_bytes, first_epoch, last_epoch,
+            self.filter_type, int(self.filter_stats.get("records_accepted", 0)), int(self.filter_stats.get("records_rejected", 0)),
         )
         return TokenChunk(
             tokens=token_np,
@@ -1009,6 +1242,14 @@ class HFRawTextSource(SourceBackend):
                 "source_epoch_end": last_epoch,
                 "exhaustion_policy": "repeat",
                 "state_exactness": "best_effort_stream_position",
+                "filter_type": self.filter_type,
+                "filter_cfg": dict(self.text_filter_cfg),
+                "filter_stats": {
+                    "records_seen": int(self.filter_stats.get("records_seen", 0)),
+                    "records_accepted": int(self.filter_stats.get("records_accepted", 0)),
+                    "records_rejected": int(self.filter_stats.get("records_rejected", 0)),
+                    "rejection_reasons": dict(self.filter_stats.get("rejection_reasons", {})),
+                },
             },
         )
 
@@ -1028,6 +1269,16 @@ class HFRawTextSource(SourceBackend):
             "text_column": self.text_column,
             "trust_remote_code": self.trust_remote_code,
             "load_dataset_kwargs": dict(self.load_dataset_kwargs),
+            "filter_type": self.filter_type,
+            "filter_cfg": dict(self.text_filter_cfg),
+            "filter_stats": {
+                "records_seen": int(self.filter_stats.get("records_seen", 0)),
+                "records_accepted": int(self.filter_stats.get("records_accepted", 0)),
+                "records_rejected": int(self.filter_stats.get("records_rejected", 0)),
+                "rejection_reasons": dict(self.filter_stats.get("rejection_reasons", {})),
+                "accepted_samples": list(self.filter_stats.get("accepted_samples", []))[: self.filter_sample_limit],
+                "rejected_samples": list(self.filter_stats.get("rejected_samples", []))[: self.filter_sample_limit],
+            },
             "tokenizer_encoding": self.tokenizer_encoding,
             "append_eot": self.append_eot,
             "shuffle_buffer": self.shuffle_buffer,
@@ -1064,6 +1315,16 @@ class HFRawTextSource(SourceBackend):
         self.last_example_index_emitted = int(state.get("last_example_index_emitted", -1))
         self.trust_remote_code = state.get("trust_remote_code", self.trust_remote_code)
         self.load_dataset_kwargs = dict(state.get("load_dataset_kwargs", self.load_dataset_kwargs))
+        if "filter_cfg" in state:
+            self.text_filter_cfg = dict(state.get("filter_cfg") or {})
+            self.text_filter = build_text_filter(self.text_filter_cfg)
+            self.filter_type = self.text_filter.filter_type
+        if "filter_stats" in state:
+            saved_stats = dict(state.get("filter_stats") or {})
+            self.filter_stats.update(saved_stats)
+            self.filter_stats.setdefault("rejection_reasons", {})
+            self.filter_stats.setdefault("accepted_samples", [])
+            self.filter_stats.setdefault("rejected_samples", [])
         self.load_dataset_seconds_total = float(state.get("load_dataset_seconds_total", 0.0))
         self.load_dataset_calls = int(state.get("load_dataset_calls", 0))
 
