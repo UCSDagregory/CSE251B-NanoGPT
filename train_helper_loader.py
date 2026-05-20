@@ -1003,6 +1003,17 @@ class HFRawTextSource(SourceBackend):
         # tokenization so the global tokenizer pool can parallelize work. EOT is
         # preserved only on the final chunk of the original document.
         self.tokenizer_chunk_chars = int(cfg.get("tokenizer_chunk_chars", cfg.get("raw_text_chunk_chars", 200_000)))
+        # For long book records, filter chunks rather than whole documents. This
+        # prevents one Gutenberg/header/footer marker from rejecting an entire
+        # otherwise useful book and lets accepted sections tokenize in parallel.
+        self.filter_after_chunking = bool(cfg.get("filter_after_chunking", True))
+        self.strip_gutenberg_boilerplate = bool(cfg.get("strip_gutenberg_boilerplate", True))
+        self.min_chunk_chars = int(cfg.get("min_chunk_chars", 1000))
+        # Fail-fast guard: small datasets may repeat forever if they accept some
+        # data, but a filtered source that accepts zero records/chunks across
+        # repeated epochs cannot satisfy a weighted request and must not hang.
+        self.max_zero_accept_epochs = int(cfg.get("max_zero_accept_epochs", 2))
+        self.max_zero_accept_records = int(cfg.get("max_zero_accept_records", 50_000))
         # Diagnostics for sources that exhaust suspiciously quickly or filters
         # that reject nearly everything. Exhaustion still always repeats, but
         # these counters make tiny/broken sources obvious in the log.
@@ -1020,6 +1031,7 @@ class HFRawTextSource(SourceBackend):
         self._dataset_obj: Optional[Any] = None
         self._inflight_batches = 0
         self._lock = threading.RLock()
+        self._pending_tokenization_chunks: List[Tuple[str, bool, int]] = []
 
         self.source_epoch = 0
         self.examples_read = 0
@@ -1211,10 +1223,33 @@ class HFRawTextSource(SourceBackend):
             self._last_filter_starvation_warning_time = now
             self._last_filter_starvation_warning_seen = seen
 
+    def _check_zero_accept_failfast(self, *, old_epoch: int, new_epoch: int) -> None:
+        total_seen = int(self.filter_stats.get("records_seen", 0))
+        total_accepted = int(self.filter_stats.get("records_accepted", 0))
+        total_rejected = int(self.filter_stats.get("records_rejected", 0))
+        if total_accepted > 0:
+            return
+        if self.max_zero_accept_epochs <= 0 and self.max_zero_accept_records <= 0:
+            return
+        too_many_epochs = self.max_zero_accept_epochs > 0 and new_epoch >= self.max_zero_accept_epochs
+        too_many_records = self.max_zero_accept_records > 0 and total_seen >= self.max_zero_accept_records
+        if not (too_many_epochs or too_many_records):
+            return
+        reasons = dict(self.filter_stats.get("rejection_reasons", {}))
+        top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        raise RuntimeError(
+            f"hf_raw_text source {self.name!r} cannot satisfy token requests: "
+            f"filter accepted 0 records/chunks after {new_epoch} epochs and {total_seen} seen "
+            f"({total_rejected} rejected). Top rejection reasons: {top_reasons}. "
+            f"This is usually a dataset/config/filter mismatch. For PG19, use "
+            f"strip_gutenberg_boilerplate=True and filter_after_chunking=True, or choose a different source."
+        )
+
     def _restart_after_exhaustion(self) -> None:
         old_epoch = self.source_epoch
         new_epoch = old_epoch + 1
         self._log_epoch_exhaustion(old_epoch=old_epoch, new_epoch=new_epoch)
+        self._check_zero_accept_failfast(old_epoch=old_epoch, new_epoch=new_epoch)
         self.source_epoch = new_epoch
         self._iterator = None
         self._dataset_obj = None
@@ -1244,6 +1279,93 @@ class HFRawTextSource(SourceBackend):
         reasons[result.reason] = int(reasons.get(result.reason, 0)) + 1
         self._remember_filter_sample(accepted=False, reason=result.reason, text=text, metrics=result.metrics)
         return False
+
+    def _strip_gutenberg_regions(self, text: str) -> str:
+        if not self.strip_gutenberg_boilerplate:
+            return text
+        lower = text.lower()
+        # Drop common Project Gutenberg/ebook front matter by starting after the
+        # first plausible body marker. This is intentionally conservative: if no
+        # marker is found, leave the text unchanged and let the chunk filter decide.
+        start_markers = (
+            "*** start of this project gutenberg",
+            "*** start of the project gutenberg",
+            "start of this project gutenberg",
+            "start of the project gutenberg",
+        )
+        start_idx = -1
+        for marker in start_markers:
+            pos = lower.find(marker)
+            if pos >= 0:
+                # Move to the next paragraph after the marker/license line.
+                next_para = text.find("\n\n", pos)
+                start_idx = next_para + 2 if next_para >= 0 else pos + len(marker)
+                break
+        if start_idx > 0:
+            text = text[start_idx:]
+            lower = text.lower()
+
+        # Remove trailing license/footer if present.
+        end_markers = (
+            "*** end of this project gutenberg",
+            "*** end of the project gutenberg",
+            "end of this project gutenberg",
+            "end of the project gutenberg",
+        )
+        end_positions = [lower.find(marker) for marker in end_markers if lower.find(marker) >= 0]
+        if end_positions:
+            text = text[: min(end_positions)]
+        return text.strip()
+
+    def _split_text_into_candidate_chunks(self, text: str) -> List[str]:
+        max_chars = int(self.tokenizer_chunk_chars)
+        if max_chars <= 0 or len(text) <= max_chars:
+            return [text.strip()] if text.strip() else []
+
+        chunks: List[str] = []
+        n = len(text)
+        start = 0
+        while start < n:
+            hard_end = min(n, start + max_chars)
+            end = hard_end
+            if hard_end < n:
+                window_start = max(start + max_chars // 2, hard_end - max(4096, max_chars // 4))
+                window = text[window_start:hard_end]
+                rel = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind(". "))
+                if rel > 0:
+                    end = window_start + rel + (2 if window[rel:rel+2] == ". " else 1)
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            start = max(end, start + 1)
+        return chunks
+
+    def _accepted_tokenization_chunks(self, text: str) -> List[Tuple[str, bool]]:
+        text = self._strip_gutenberg_regions(text)
+        if not text:
+            return []
+
+        if not self.filter_after_chunking:
+            if not self._filter_accepts(text):
+                return []
+            chunks = self._split_text_into_candidate_chunks(text)
+        else:
+            chunks = []
+            for candidate in self._split_text_into_candidate_chunks(text):
+                if len(candidate) < self.min_chunk_chars:
+                    self.filter_stats["records_seen"] = int(self.filter_stats.get("records_seen", 0)) + 1
+                    self.filter_stats["records_rejected"] = int(self.filter_stats.get("records_rejected", 0)) + 1
+                    reasons = self.filter_stats.setdefault("rejection_reasons", {})
+                    reasons["chunk_too_short"] = int(reasons.get("chunk_too_short", 0)) + 1
+                    continue
+                if self._filter_accepts(candidate):
+                    chunks.append(candidate)
+                else:
+                    self._maybe_log_filter_starvation()
+
+        if not chunks:
+            return []
+        return [(chunk, bool(self.append_eot) and i == len(chunks) - 1) for i, chunk in enumerate(chunks)]
 
     def _split_text_for_tokenization(self, text: str) -> List[Tuple[str, bool]]:
         """Split one accepted raw document into tokenizer-sized chunks.
@@ -1288,6 +1410,20 @@ class HFRawTextSource(SourceBackend):
         append_eot_flags: List[bool] = []
         raw_bytes = 0
         first_idx: Optional[int] = None
+        last_idx_for_batch = self.last_example_index_read
+
+        # Drain accepted chunks left over from a previous large document before
+        # reading more raw records. This prevents losing useful chunks when a
+        # whole accepted book is split into many tokenizer-sized pieces.
+        while self._pending_tokenization_chunks and len(texts) < self.read_batch_examples and raw_bytes < self.read_batch_bytes:
+            chunk_text, chunk_append_eot, chunk_idx = self._pending_tokenization_chunks.pop(0)
+            if first_idx is None:
+                first_idx = chunk_idx
+            last_idx_for_batch = max(last_idx_for_batch, chunk_idx)
+            texts.append(chunk_text)
+            append_eot_flags.append(chunk_append_eot)
+            raw_bytes += len(chunk_text.encode("utf-8", errors="ignore"))
+
         while len(texts) < self.read_batch_examples and raw_bytes < self.read_batch_bytes:
             try:
                 ex = next(self._iterator)  # type: ignore[arg-type]
@@ -1318,23 +1454,27 @@ class HFRawTextSource(SourceBackend):
                 reasons["too_large_raw_doc"] = int(reasons.get("too_large_raw_doc", 0)) + 1
                 self._maybe_log_filter_starvation()
                 continue
-            if not self._filter_accepts(text):
+            accepted_chunks = self._accepted_tokenization_chunks(text)
+            if not accepted_chunks:
                 self._maybe_log_filter_starvation()
                 continue
             if first_idx is None:
                 first_idx = idx
-            split_chunks = self._split_text_for_tokenization(text)
-            for chunk_text, chunk_append_eot in split_chunks:
+            for i, (chunk_text, chunk_append_eot) in enumerate(accepted_chunks):
+                if len(texts) >= self.read_batch_examples or raw_bytes >= self.read_batch_bytes:
+                    self._pending_tokenization_chunks.extend((ct, ae, idx) for ct, ae in accepted_chunks[i:])
+                    break
                 texts.append(chunk_text)
                 append_eot_flags.append(chunk_append_eot)
                 raw_bytes += len(chunk_text.encode("utf-8", errors="ignore"))
+                last_idx_for_batch = max(last_idx_for_batch, idx)
         if not texts:
             return False
         ok = self.raw_manager.submit(RawTextBatch(
             texts=texts,
             raw_bytes=raw_bytes,
             first_example_index=first_idx if first_idx is not None else self.last_example_index_read,
-            last_example_index=self.last_example_index_read,
+            last_example_index=last_idx_for_batch,
             source_name=self.name,
             source_epoch=self.source_epoch,
             tokenizer_encoding=self.tokenizer_encoding,
@@ -1484,6 +1624,11 @@ class HFRawTextSource(SourceBackend):
             "filter_type": self.filter_type,
             "filter_cfg": dict(self.text_filter_cfg),
             "tokenizer_chunk_chars": self.tokenizer_chunk_chars,
+            "filter_after_chunking": self.filter_after_chunking,
+            "strip_gutenberg_boilerplate": self.strip_gutenberg_boilerplate,
+            "min_chunk_chars": self.min_chunk_chars,
+            "max_zero_accept_epochs": self.max_zero_accept_epochs,
+            "max_zero_accept_records": self.max_zero_accept_records,
             "filter_stats": {
                 "records_seen": int(self.filter_stats.get("records_seen", 0)),
                 "records_accepted": int(self.filter_stats.get("records_accepted", 0)),
@@ -1508,6 +1653,7 @@ class HFRawTextSource(SourceBackend):
             "load_dataset_seconds_total": self.load_dataset_seconds_total,
             "load_dataset_calls": self.load_dataset_calls,
             "inflight_batches": self._inflight_batches,
+            "pending_tokenization_chunks": len(self._pending_tokenization_chunks),
             "prefetch_batches": self.prefetch_batches,
             "small_epoch_warn_records": self.small_epoch_warn_records,
             "small_epoch_warn_accepted": self.small_epoch_warn_accepted,
@@ -1538,6 +1684,16 @@ class HFRawTextSource(SourceBackend):
             self.filter_type = self.text_filter.filter_type
         if "tokenizer_chunk_chars" in state:
             self.tokenizer_chunk_chars = int(state.get("tokenizer_chunk_chars") or self.tokenizer_chunk_chars)
+        if "filter_after_chunking" in state:
+            self.filter_after_chunking = bool(state.get("filter_after_chunking"))
+        if "strip_gutenberg_boilerplate" in state:
+            self.strip_gutenberg_boilerplate = bool(state.get("strip_gutenberg_boilerplate"))
+        if "min_chunk_chars" in state:
+            self.min_chunk_chars = int(state.get("min_chunk_chars") or self.min_chunk_chars)
+        if "max_zero_accept_epochs" in state:
+            self.max_zero_accept_epochs = int(state.get("max_zero_accept_epochs") or self.max_zero_accept_epochs)
+        if "max_zero_accept_records" in state:
+            self.max_zero_accept_records = int(state.get("max_zero_accept_records") or self.max_zero_accept_records)
         if "filter_stats" in state:
             saved_stats = dict(state.get("filter_stats") or {})
             self.filter_stats.update(saved_stats)
